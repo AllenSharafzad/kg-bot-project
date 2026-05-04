@@ -1,0 +1,284 @@
+{
+  "graphrag": [
+    {
+      "id": "Q01",
+      "category": "A",
+      "question": "If a full-time PhD student fails their Probationary Review, what are the possible outcomes and deadlines?",
+      "ground_truth": "If a full-time PhD student fails their Probationary Review, the outcomes may include a requirement to re-submit within a specified deadline, transfer to an MPhil programme, or withdrawal from the programme. The specific deadlines for full-time students are defined in the relevant conditions of the Probationary Review rule.",
+      "bot_answer": "This information is not available in the current policy graph. Please consult the BU Doctoral College directly.",
+      "cypher": "-- fallback --\nMATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'full' OR toLower(coalesce(r.description,'')) CONTAINS 'full' OR toLower(coalesce(r.label,'')) CONTAINS 'full' OR toLower(coalesce(o.text,'')) CONTAINS 'full' OR toLower(coalesce(c.text,'')) CONTAINS 'time' OR toLower(coalesce(r.description,'')) CONTAINS 'time' OR toLower(coalesce(r.label,'')) CONTAINS 'time' OR toLower(coalesce(o.text,'')) CONTAINS 'time' OR toLower(coalesce(c.text,'')) CONTAINS 'phd' OR toLower(coalesce(r.description,'')) CONTAINS 'phd' OR toLower(coalesce(r.label,'')) CONTAINS 'phd' OR toLower(coalesce(o.text,'')) CONTAINS 'phd' OR toLower(coalesce(c.text,'')) CONTAINS 'student' OR toLower(coalesce(r.description,'')) CONTAINS 'student' OR toLower(coalesce(r.label,'')) CONTAINS 'student' OR toLower(coalesce(o.text,'')) CONTAINS 'student' OR toLower(coalesce(c.text,'')) CONTAINS 'fails' OR toLower(coalesce(r.description,'')) CONTAINS 'fails' OR toLower(coalesce(r.label,'')) CONTAINS 'fails' OR toLower(coalesce(o.text,'')) CONTAINS 'fails'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.1', 'conditionText': 'PGR submits Probationary Review document on ProGRess', 'conditionTitle': None, 'outcomes': ['Progression: Panel recommends Progression \u2014 PGR continues to PhD'], 'conflictScenario': None, 'conflictResolution': None, 'conflictingConditionId': None, 'conflictingConditionText': None}, {'ruleI",
+      "expected_ids": [
+        "C4.1.1",
+        "C4.1.2",
+        "O4.1.1",
+        "O4.1.2",
+        "R4.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 6.47,
+      "error": null
+    },
+    {
+      "id": "Q02",
+      "category": "A",
+      "question": "I am a part-time student. What is the maximum period of registration allowed before I must submit my thesis?",
+      "ground_truth": "Part-time students have a maximum registration period defined in the conditions of the registration rules. Extensions may be granted under specific circumstances as outlined in the relevant policy section.",
+      "bot_answer": "This information is not available in the current policy graph. Please consult the BU Doctoral College directly.",
+      "cypher": "-- fallback --\nMATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'part' OR toLower(coalesce(r.description,'')) CONTAINS 'part' OR toLower(coalesce(r.label,'')) CONTAINS 'part' OR toLower(coalesce(o.text,'')) CONTAINS 'part' OR toLower(coalesce(c.text,'')) CONTAINS 'time' OR toLower(coalesce(r.description,'')) CONTAINS 'time' OR toLower(coalesce(r.label,'')) CONTAINS 'time' OR toLower(coalesce(o.text,'')) CONTAINS 'time' OR toLower(coalesce(c.text,'')) CONTAINS 'student' OR toLower(coalesce(r.description,'')) CONTAINS 'student' OR toLower(coalesce(r.label,'')) CONTAINS 'student' OR toLower(coalesce(o.text,'')) CONTAINS 'student' OR toLower(coalesce(c.text,'')) CONTAINS 'maximum' OR toLower(coalesce(r.description,'')) CONTAINS 'maximum' OR toLower(coalesce(r.label,'')) CONTAINS 'maximum' OR toLower(coalesce(o.text,'')) CONTAINS 'maximum' OR toLower(coalesce(c.text,'')) CONTAINS 'period' OR toLower(coalesce(r.description,'')) CONTAINS 'period' OR toLower(coalesce(r.label,'')) CONTAINS 'period' OR toLower(coalesce(o.text,'')) CONTAINS 'period'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.1', 'conditionText': 'PGR submits Probationary Review document on ProGRess', 'conditionTitle': None, 'outcomes': ['Extension: Probationary period extended, normally by 1 month'], 'conflictScenario': None, 'conflictResolution': None, 'conflictingConditionId': None, 'conflictingConditionText': None}, {'ruleId': ",
+      "expected_ids": [
+        "C3.1.1",
+        "C3.1.2",
+        "R3.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 3.86,
+      "error": null
+    },
+    {
+      "id": "Q03",
+      "category": "A",
+      "question": "What happens if a doctoral candidate does not respond to required changes after their viva voce examination?",
+      "ground_truth": "If a candidate does not complete required changes within the specified period after the viva, the outcome may include termination of candidature or referral back for re-examination, as defined by the examination rules.",
+      "bot_answer": "This information is not available in the current policy graph. Please consult the BU Doctoral College directly.",
+      "cypher": "",
+      "raw_context": "[]",
+      "expected_ids": [
+        "C6.1.1",
+        "O6.1.1",
+        "O6.1.2",
+        "R6.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 0.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 0,
+        "path_accuracy": 0.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 3.36,
+      "error": null
+    },
+    {
+      "id": "Q04",
+      "category": "A",
+      "question": "If I want to transfer from MPhil to PhD, what conditions must I satisfy and what is the process?",
+      "ground_truth": "To transfer from MPhil to PhD, the candidate must satisfy conditions including demonstrating research progress, submitting a transfer report, and having approval from the supervisory team and relevant committee.",
+      "bot_answer": "To transfer from MPhil to PhD, you must satisfy the conditions outlined in the Probationary Review process.\n\n1. **Policy Basis**: The Probationary Review is an early milestone to confirm the potential for successful completion of a PGR program (BU CoP \u00a710.4). The conditions include:\n   - Submission of the Probationary Review document on ProGRess (BU CoP \u00a710.4, C4.1.1).\n   - Meeting the submission deadline of 3 months for full-time or 6 months for part-time post-enrolment (BU CoP \u00a710.4, C4.1.2).\n   - Ensuring the document does not exceed 2000 words (BU CoP \u00a710.4, C4.1.3).\n   - Completion of the Ethics e-module with the date recorded in the report (BU CoP \u00a710.4, C4.1.4).\n   - A statement of support from the supervisory team added on ProGRess (BU CoP \u00a710.4, C4.1.5).\n   - A faculty panel comprising the Departmental PGR Lead (chair) and an independent academic (BU CoP \u00a710.4, C4.1.6).\n\n2. **Applicable Outcomes**: The panel may recommend progression, allowing you to continue to a PhD, or they may recommend a transfer to MRes.\n\n3. **Conflicts Detected**: None.\n\n4. **Recommended Action**: Ensure all conditions are met and documented as required. Submit the necessary documents and complete the Ethics e-module within the specified timeframe. Engage with your supervisory team for their support and ensure the faculty panel is appropriately constituted.",
+      "cypher": "-- fallback --\nMATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'want' OR toLower(coalesce(r.description,'')) CONTAINS 'want' OR toLower(coalesce(r.label,'')) CONTAINS 'want' OR toLower(coalesce(o.text,'')) CONTAINS 'want' OR toLower(coalesce(c.text,'')) CONTAINS 'transfer' OR toLower(coalesce(r.description,'')) CONTAINS 'transfer' OR toLower(coalesce(r.label,'')) CONTAINS 'transfer' OR toLower(coalesce(o.text,'')) CONTAINS 'transfer' OR toLower(coalesce(c.text,'')) CONTAINS 'from' OR toLower(coalesce(r.description,'')) CONTAINS 'from' OR toLower(coalesce(r.label,'')) CONTAINS 'from' OR toLower(coalesce(o.text,'')) CONTAINS 'from' OR toLower(coalesce(c.text,'')) CONTAINS 'mphil' OR toLower(coalesce(r.description,'')) CONTAINS 'mphil' OR toLower(coalesce(r.label,'')) CONTAINS 'mphil' OR toLower(coalesce(o.text,'')) CONTAINS 'mphil' OR toLower(coalesce(c.text,'')) CONTAINS 'phd' OR toLower(coalesce(r.description,'')) CONTAINS 'phd' OR toLower(coalesce(r.label,'')) CONTAINS 'phd' OR toLower(coalesce(o.text,'')) CONTAINS 'phd'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.1', 'conditionText': 'PGR submits Probationary Review document on ProGRess', 'conditionTitle': None, 'outcomes': ['Progression: Panel recommends Progression \u2014 PGR continues to PhD', 'Transfer: PGR transferred to MRes'], 'conflictScenario': None, 'conflictResolution': None, 'conflictingConditionId': None, 'conf",
+      "expected_ids": [
+        "C4.2.1",
+        "C4.2.2",
+        "O4.2.1",
+        "R4.2"
+      ],
+      "retrieved_ids": [
+        "C4.1.1",
+        "C4.1.2",
+        "C4.1.3",
+        "C4.1.4",
+        "C4.1.5",
+        "C4.1.6",
+        "R4.1"
+      ],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.8,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 7.96,
+      "error": null
+    },
+    {
+      "id": "Q05",
+      "category": "A",
+      "question": "A student has been sanctioned for academic misconduct during their research degree. Can they still progress to the viva?",
+      "ground_truth": "Progression to viva after an academic misconduct sanction depends on the severity of the sanction and the resolution applied. The relevant rules define whether the sanction permits continued candidature or results in termination.",
+      "bot_answer": "This information is not available in the current policy graph. Please consult the BU Doctoral College directly.",
+      "cypher": "-- fallback --\nMATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'student' OR toLower(coalesce(r.description,'')) CONTAINS 'student' OR toLower(coalesce(r.label,'')) CONTAINS 'student' OR toLower(coalesce(o.text,'')) CONTAINS 'student' OR toLower(coalesce(c.text,'')) CONTAINS 'sanctioned' OR toLower(coalesce(r.description,'')) CONTAINS 'sanctioned' OR toLower(coalesce(r.label,'')) CONTAINS 'sanctioned' OR toLower(coalesce(o.text,'')) CONTAINS 'sanctioned' OR toLower(coalesce(c.text,'')) CONTAINS 'academic' OR toLower(coalesce(r.description,'')) CONTAINS 'academic' OR toLower(coalesce(r.label,'')) CONTAINS 'academic' OR toLower(coalesce(o.text,'')) CONTAINS 'academic' OR toLower(coalesce(c.text,'')) CONTAINS 'misconduct' OR toLower(coalesce(r.description,'')) CONTAINS 'misconduct' OR toLower(coalesce(r.label,'')) CONTAINS 'misconduct' OR toLower(coalesce(o.text,'')) CONTAINS 'misconduct' OR toLower(coalesce(c.text,'')) CONTAINS 'during' OR toLower(coalesce(r.description,'')) CONTAINS 'during' OR toLower(coalesce(r.label,'')) CONTAINS 'during' OR toLower(coalesce(o.text,'')) CONTAINS 'during'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.6', 'conditionText': 'Faculty panel comprises Departmental PGR Lead (chair) and independent academic', 'conditionTitle': None, 'outcomes': ['Progression: Panel recommends Progression \u2014 PGR continues to PhD', 'Extension: Probationary period extended, normally by 1 month', 'Transfer: PGR transferred to MRes', 'W",
+      "expected_ids": [
+        "C7.1.1",
+        "O7.1.1",
+        "O7.1.2",
+        "R7.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 3.98,
+      "error": null
+    }
+  ],
+  "vectorrag": [
+    {
+      "id": "Q01",
+      "category": "A",
+      "question": "If a full-time PhD student fails their Probationary Review, what are the possible outcomes and deadlines?",
+      "ground_truth": "If a full-time PhD student fails their Probationary Review, the outcomes may include a requirement to re-submit within a specified deadline, transfer to an MPhil programme, or withdrawal from the programme. The specific deadlines for full-time students are defined in the relevant conditions of the Probationary Review rule.",
+      "bot_answer": "This information is not available in the current policy graph. Please consult the BU Doctoral College directly.",
+      "cypher": "MATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'full' OR toLower(coalesce(r.description,'')) CONTAINS 'full' OR toLower(coalesce(r.label,'')) CONTAINS 'full' OR toLower(coalesce(o.text,'')) CONTAINS 'full' OR toLower(coalesce(c.text,'')) CONTAINS 'time' OR toLower(coalesce(r.description,'')) CONTAINS 'time' OR toLower(coalesce(r.label,'')) CONTAINS 'time' OR toLower(coalesce(o.text,'')) CONTAINS 'time' OR toLower(coalesce(c.text,'')) CONTAINS 'phd' OR toLower(coalesce(r.description,'')) CONTAINS 'phd' OR toLower(coalesce(r.label,'')) CONTAINS 'phd' OR toLower(coalesce(o.text,'')) CONTAINS 'phd' OR toLower(coalesce(c.text,'')) CONTAINS 'student' OR toLower(coalesce(r.description,'')) CONTAINS 'student' OR toLower(coalesce(r.label,'')) CONTAINS 'student' OR toLower(coalesce(o.text,'')) CONTAINS 'student' OR toLower(coalesce(c.text,'')) CONTAINS 'fails' OR toLower(coalesce(r.description,'')) CONTAINS 'fails' OR toLower(coalesce(r.label,'')) CONTAINS 'fails' OR toLower(coalesce(o.text,'')) CONTAINS 'fails'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.1', 'conditionText': 'PGR submits Probationary Review document on ProGRess', 'conditionTitle': None, 'outcomes': ['Progression: Panel recommends Progression \u2014 PGR continues to PhD'], 'conflictScenario': None, 'conflictResolution': None, 'conflictingConditionId': None, 'conflictingConditionText': None}, {'ruleI",
+      "expected_ids": [
+        "C4.1.1",
+        "C4.1.2",
+        "O4.1.1",
+        "O4.1.2",
+        "R4.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 1.0,
+      "error": null
+    },
+    {
+      "id": "Q02",
+      "category": "A",
+      "question": "I am a part-time student. What is the maximum period of registration allowed before I must submit my thesis?",
+      "ground_truth": "Part-time students have a maximum registration period defined in the conditions of the registration rules. Extensions may be granted under specific circumstances as outlined in the relevant policy section.",
+      "bot_answer": "This information is not available in the current policy graph. Please consult the BU Doctoral College directly.",
+      "cypher": "MATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'part' OR toLower(coalesce(r.description,'')) CONTAINS 'part' OR toLower(coalesce(r.label,'')) CONTAINS 'part' OR toLower(coalesce(o.text,'')) CONTAINS 'part' OR toLower(coalesce(c.text,'')) CONTAINS 'time' OR toLower(coalesce(r.description,'')) CONTAINS 'time' OR toLower(coalesce(r.label,'')) CONTAINS 'time' OR toLower(coalesce(o.text,'')) CONTAINS 'time' OR toLower(coalesce(c.text,'')) CONTAINS 'student' OR toLower(coalesce(r.description,'')) CONTAINS 'student' OR toLower(coalesce(r.label,'')) CONTAINS 'student' OR toLower(coalesce(o.text,'')) CONTAINS 'student' OR toLower(coalesce(c.text,'')) CONTAINS 'maximum' OR toLower(coalesce(r.description,'')) CONTAINS 'maximum' OR toLower(coalesce(r.label,'')) CONTAINS 'maximum' OR toLower(coalesce(o.text,'')) CONTAINS 'maximum' OR toLower(coalesce(c.text,'')) CONTAINS 'period' OR toLower(coalesce(r.description,'')) CONTAINS 'period' OR toLower(coalesce(r.label,'')) CONTAINS 'period' OR toLower(coalesce(o.text,'')) CONTAINS 'period'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.1', 'conditionText': 'PGR submits Probationary Review document on ProGRess', 'conditionTitle': None, 'outcomes': ['Extension: Probationary period extended, normally by 1 month'], 'conflictScenario': None, 'conflictResolution': None, 'conflictingConditionId': None, 'conflictingConditionText': None}, {'ruleId': ",
+      "expected_ids": [
+        "C3.1.1",
+        "C3.1.2",
+        "R3.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 0.74,
+      "error": null
+    },
+    {
+      "id": "Q03",
+      "category": "A",
+      "question": "What happens if a doctoral candidate does not respond to required changes after their viva voce examination?",
+      "ground_truth": "If a candidate does not complete required changes within the specified period after the viva, the outcome may include termination of candidature or referral back for re-examination, as defined by the examination rules.",
+      "bot_answer": "This information is not available.",
+      "cypher": "N/A",
+      "raw_context": "[]",
+      "expected_ids": [
+        "C6.1.1",
+        "O6.1.1",
+        "O6.1.2",
+        "R6.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 0.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 0,
+        "path_accuracy": 0.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 0.08,
+      "error": null
+    },
+    {
+      "id": "Q04",
+      "category": "A",
+      "question": "If I want to transfer from MPhil to PhD, what conditions must I satisfy and what is the process?",
+      "ground_truth": "To transfer from MPhil to PhD, the candidate must satisfy conditions including demonstrating research progress, submitting a transfer report, and having approval from the supervisory team and relevant committee.",
+      "bot_answer": "To transfer from MPhil to PhD, you must satisfy the conditions outlined in the Probationary Review process.\n\n1. **Policy basis**: The Probationary Review is an early milestone to confirm the potential for successful completion of a PGR program (BU CoP \u00a710.4). The conditions include:\n   - Submitting the Probationary Review document on ProGRess (BU CoP \u00a710.4).\n   - Meeting the submission deadline of 3 months for full-time or 6 months for part-time post-enrolment (BU CoP \u00a710.4).\n   - Ensuring the document does not exceed 2000 words (BU CoP \u00a710.4).\n   - Completing the Ethics e-module and recording the date in the report (BU CoP \u00a710.4).\n   - Having your supervisory team add a statement of support on ProGRess (BU CoP \u00a710.4).\n   - The faculty panel must comprise the Departmental PGR Lead (chair) and an independent academic (BU CoP \u00a710.4).\n\n2. **Applicable outcomes**: The panel may recommend progression, allowing you to continue to a PhD, or they may decide on a transfer to MRes (BU CoP \u00a710.4).\n\n3. **Conflicts detected**: None.\n\n4. **Recommended action**: Ensure all conditions are met and submit the required documentation by the specified deadlines. Engage with your supervisory team for their support and ensure the Ethics e-module is completed.",
+      "cypher": "MATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'want' OR toLower(coalesce(r.description,'')) CONTAINS 'want' OR toLower(coalesce(r.label,'')) CONTAINS 'want' OR toLower(coalesce(o.text,'')) CONTAINS 'want' OR toLower(coalesce(c.text,'')) CONTAINS 'transfer' OR toLower(coalesce(r.description,'')) CONTAINS 'transfer' OR toLower(coalesce(r.label,'')) CONTAINS 'transfer' OR toLower(coalesce(o.text,'')) CONTAINS 'transfer' OR toLower(coalesce(c.text,'')) CONTAINS 'from' OR toLower(coalesce(r.description,'')) CONTAINS 'from' OR toLower(coalesce(r.label,'')) CONTAINS 'from' OR toLower(coalesce(o.text,'')) CONTAINS 'from' OR toLower(coalesce(c.text,'')) CONTAINS 'mphil' OR toLower(coalesce(r.description,'')) CONTAINS 'mphil' OR toLower(coalesce(r.label,'')) CONTAINS 'mphil' OR toLower(coalesce(o.text,'')) CONTAINS 'mphil' OR toLower(coalesce(c.text,'')) CONTAINS 'phd' OR toLower(coalesce(r.description,'')) CONTAINS 'phd' OR toLower(coalesce(r.label,'')) CONTAINS 'phd' OR toLower(coalesce(o.text,'')) CONTAINS 'phd'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.1', 'conditionText': 'PGR submits Probationary Review document on ProGRess', 'conditionTitle': None, 'outcomes': ['Progression: Panel recommends Progression \u2014 PGR continues to PhD', 'Transfer: PGR transferred to MRes'], 'conflictScenario': None, 'conflictResolution': None, 'conflictingConditionId': None, 'conf",
+      "expected_ids": [
+        "C4.2.1",
+        "C4.2.2",
+        "O4.2.1",
+        "R4.2"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.8,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 4.22,
+      "error": null
+    },
+    {
+      "id": "Q05",
+      "category": "A",
+      "question": "A student has been sanctioned for academic misconduct during their research degree. Can they still progress to the viva?",
+      "ground_truth": "Progression to viva after an academic misconduct sanction depends on the severity of the sanction and the resolution applied. The relevant rules define whether the sanction permits continued candidature or results in termination.",
+      "bot_answer": "This information is not available in the current policy graph. Please consult the BU Doctoral College directly.",
+      "cypher": "MATCH (r:Rule)\n    OPTIONAL MATCH (r)-[:HAS_CONDITION]->(c:Condition)\n    OPTIONAL MATCH (r)-[:HAS_OUTCOME]->(o:Outcome)\n    OPTIONAL MATCH (c)-[cf:CONFLICTS_WITH]-(c2:Condition)\n    WITH r, c, o, cf, c2\n    WHERE toLower(coalesce(c.text,'')) CONTAINS 'student' OR toLower(coalesce(r.description,'')) CONTAINS 'student' OR toLower(coalesce(r.label,'')) CONTAINS 'student' OR toLower(coalesce(o.text,'')) CONTAINS 'student' OR toLower(coalesce(c.text,'')) CONTAINS 'sanctioned' OR toLower(coalesce(r.description,'')) CONTAINS 'sanctioned' OR toLower(coalesce(r.label,'')) CONTAINS 'sanctioned' OR toLower(coalesce(o.text,'')) CONTAINS 'sanctioned' OR toLower(coalesce(c.text,'')) CONTAINS 'academic' OR toLower(coalesce(r.description,'')) CONTAINS 'academic' OR toLower(coalesce(r.label,'')) CONTAINS 'academic' OR toLower(coalesce(o.text,'')) CONTAINS 'academic' OR toLower(coalesce(c.text,'')) CONTAINS 'misconduct' OR toLower(coalesce(r.description,'')) CONTAINS 'misconduct' OR toLower(coalesce(r.label,'')) CONTAINS 'misconduct' OR toLower(coalesce(o.text,'')) CONTAINS 'misconduct' OR toLower(coalesce(c.text,'')) CONTAINS 'during' OR toLower(coalesce(r.description,'')) CONTAINS 'during' OR toLower(coalesce(r.label,'')) CONTAINS 'during' OR toLower(coalesce(o.text,'')) CONTAINS 'during'\n    RETURN r.id AS ruleId, r.label AS ruleLabel,\n           r.sourceSection AS ruleSection, r.description AS ruleDescription,\n           c.id AS conditionId, c.text AS conditionText,\n           c.label_human AS conditionTitle,\n           collect(DISTINCT o.type + ': ' + o.text) AS outcomes,\n           cf.scenario    AS conflictScenario,\n           cf.resolution  AS conflictResolution,\n           c2.id          AS conflictingConditionId,\n           c2.text        AS conflictingConditionText\n    LIMIT 25",
+      "raw_context": "[{'ruleId': 'R4.1', 'ruleLabel': 'Probationary Review', 'ruleSection': '10.4', 'ruleDescription': 'Early milestone to confirm PGR potential for successful completion', 'conditionId': 'C4.1.6', 'conditionText': 'Faculty panel comprises Departmental PGR Lead (chair) and independent academic', 'conditionTitle': None, 'outcomes': ['Progression: Panel recommends Progression \u2014 PGR continues to PhD', 'Extension: Probationary period extended, normally by 1 month', 'Transfer: PGR transferred to MRes', 'W",
+      "expected_ids": [
+        "C7.1.1",
+        "O7.1.1",
+        "O7.1.2",
+        "R7.1"
+      ],
+      "retrieved_ids": [],
+      "scores": {
+        "faithfulness": 1.0,
+        "answer_relevance": 0.0,
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieval_depth": 4,
+        "path_accuracy": 1.0,
+        "conflict_detection": 1.0
+      },
+      "latency_s": 0.78,
+      "error": null
+    }
+  ]
+}

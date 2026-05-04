@@ -1,0 +1,9 @@
+Metric,GraphRAG,VectorRAG,Delta
+Faithfulness,0.8000,0.8000,+0.0000
+Answer Relevance,0.1600,0.1600,+0.0000
+Context Precision,0.0000,0.0000,+0.0000
+Context Recall,0.0000,0.0000,+0.0000
+Path Accuracy,0.8000,0.8000,+0.0000
+Conflict Detection Rate,1.0000,1.0000,+0.0000
+Avg Latency (s),5.13,1.36,—
+Avg Retrieval Depth,3.2,3.2,—

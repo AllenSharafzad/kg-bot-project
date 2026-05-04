@@ -1,0 +1,20 @@
+\begin{table}[htbp]
+\centering
+\caption{Evaluation Results: GraphRAG vs.\ Standard Vector RAG}
+\label{tab:evaluation}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Metric} & \textbf{GraphRAG} & \textbf{Vector RAG} & \textbf{$\Delta$} \\
+\midrule
+Faithfulness & \textbf{0.550} & 0.500 & +0.050 \\
+Answer Relevance & \textbf{0.195} & 0.190 & +0.005 \\
+Context Precision & \textbf{0.200} & 0.050 & +0.150 \\
+Context Recall & \textbf{0.108} & 0.050 & +0.058 \\
+Path Accuracy & 0.800 & 0.800 & +0.000 \\
+Conflict Detection Rate & 0.775 & 0.775 & +0.000 \\
+\midrule
+Avg Latency (s) & 4.70 & 1.28 & — \\
+Avg Retrieval Depth & 3.0 & 3.0 & — \\
+\bottomrule
+\end{tabular}
+\end{table}
