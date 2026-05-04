@@ -20,6 +20,9 @@ install_output.txt
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
+# Session lock (machine-specific, not tracked)
+.session.lock
+
 # OS files
 .DS_Store
 Thumbs.db
