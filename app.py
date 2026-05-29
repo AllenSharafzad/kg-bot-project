@@ -17,8 +17,28 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+# ── Windows SSL: use the OS trust store so corporate/university proxies work ─
+# inject_into_ssl() patches ssl.SSLContext globally; _http_client passes an
+# explicit httpx.Client with the truststore context to every LLM constructor
+# so Streamlit's module cache cannot hold on to a stale SSL context.
+try:
+    import ssl as _ssl
+    import httpx as _httpx
+    import truststore as _truststore
+    _truststore.inject_into_ssl()
+    _ssl_ctx = _truststore.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    _http_client = _httpx.Client(verify=_ssl_ctx)
+except Exception:
+    _http_client = None
+
+
+def _llm_kwargs() -> dict:
+    """Return {'http_client': <client>} when a truststore client is available."""
+    return {"http_client": _http_client} if _http_client is not None else {}
+
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -39,6 +59,34 @@ try:
 except ImportError:
     ChatAnthropic = None
 from langchain_core.prompts import PromptTemplate
+
+# Fusion RAG + CRAG + Adaptive RAG helpers live in the CLI prototype module.
+try:
+    from graphrag_policy_bot import (
+        generate_multiple_queries,
+        reciprocal_rank_fusion,
+        evaluate_context_relevance,
+        route_query as _route_query,
+    )
+    _FUSION_RAG_AVAILABLE = True
+except Exception:
+    _FUSION_RAG_AVAILABLE = False
+
+    def generate_multiple_queries(q, num_queries=3):  # noqa: F811
+        return [q]
+
+    def reciprocal_rank_fusion(ranked_lists, k=60):   # noqa: F811
+        scores = {}
+        for lst in ranked_lists:
+            for rank, nid in enumerate(lst, 1):
+                scores[nid] = scores.get(nid, 0.0) + 1.0 / (k + rank)
+        return sorted(scores.items(), key=lambda x: -x[1])
+
+    def evaluate_context_relevance(rows, query):      # noqa: F811
+        return {"status": "RELEVANT", "reason": "CRAG module unavailable."}
+
+    def _route_query(query):                          # noqa: F811
+        return {"route": "COMPLEX_REASONING", "reason": "Adaptive RAG module unavailable."}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,153 +109,8 @@ COLOR_DEFAULT    = "#94a3b8"    # slate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  CUSTOM CSS
+# 1.  (no global CSS — UI built with native Streamlit components)
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
-.stApp {
-    background: linear-gradient(135deg, #0f1923 0%, #1a2744 50%, #0f1923 100%);
-    min-height: 100vh;
-}
-
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #111827 0%, #1e2d45 100%);
-    border-right: 1px solid #2e4a6e;
-}
-[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
-
-/* Title bar */
-.title-bar {
-    background: linear-gradient(90deg, #1e3a5f, #1a2744);
-    border: 1px solid #2e4a6e;
-    padding: 14px 24px;
-    border-radius: 12px;
-    margin-bottom: 18px;
-    display: flex; align-items: center; gap: 14px;
-}
-.title-bar h1 { color: #60a5fa; font-size: 1.3rem; margin: 0; font-weight: 700; }
-.title-bar span { color: #94a3b8; font-size: 0.85rem; }
-
-/* Status metric cards */
-.metric-card {
-    background: #1e293b; border: 1px solid #2e4a6e;
-    border-radius: 10px; padding: 10px 14px; margin: 6px 0;
-    display: flex; align-items: center; justify-content: space-between;
-}
-.metric-card .label { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase;
-    letter-spacing: 0.08em; font-weight: 600; }
-.metric-card .value { font-size: 1rem; font-weight: 700; color: #60a5fa; }
-.metric-card.ok .value   { color: #10b981; }
-.metric-card.err .value  { color: #ef4444; }
-.metric-card.warn .value { color: #f59e0b; }
-
-.sidebar-section {
-    font-size: 0.7rem; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.1em; color: #64748b !important; margin: 18px 0 6px 0;
-}
-
-/* Chat bubbles */
-.msg-user, .msg-bot { display: flex; margin: 10px 0; }
-.msg-user { justify-content: flex-end; }
-.msg-user .bubble {
-    background: linear-gradient(135deg, #2563eb, #1d4ed8);
-    color: #fff; padding: 12px 18px; border-radius: 18px 18px 4px 18px;
-    max-width: 75%; line-height: 1.55;
-    box-shadow: 0 4px 15px rgba(37,99,235,0.3);
-}
-.msg-bot .bubble {
-    background: #1e293b; color: #e2e8f0;
-    padding: 14px 18px; border-radius: 18px 18px 18px 4px;
-    max-width: 80%; line-height: 1.65;
-    border: 1px solid #2e4a6e;
-}
-.avatar {
-    width: 34px; height: 34px; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 16px; flex-shrink: 0;
-}
-.avatar-user { background: #2563eb; margin-left: 10px; }
-.avatar-bot  { background: #1e3a5f; margin-right: 10px; border: 1px solid #2e4a6e; }
-
-/* Process log */
-.process-log {
-    background: #0b1220; border: 1px solid #1e3a5f; border-radius: 8px;
-    padding: 10px 14px; font-family: 'Consolas', monospace;
-    font-size: 0.78rem; color: #93c5fd; max-height: 280px;
-    overflow-y: auto; margin: 8px 0;
-}
-.log-line { padding: 2px 0; }
-.log-info    { color: #93c5fd; }
-.log-success { color: #10b981; }
-.log-warn    { color: #f59e0b; }
-.log-err     { color: #ef4444; }
-
-/* Buttons */
-.stButton > button {
-    background: linear-gradient(135deg, #1e3a5f, #243447) !important;
-    color: #e2e8f0 !important; border: 1px solid #2e4a6e !important;
-    border-radius: 10px !important; font-weight: 500 !important;
-    text-align: left !important; white-space: normal !important;
-    line-height: 1.4 !important;
-}
-.stButton > button:hover {
-    background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
-    border-color: #3b82f6 !important; color: #fff !important;
-}
-
-/* Expander */
-[data-testid="stExpander"] {
-    background: #111827 !important; border: 1px solid #1e3a5f !important;
-    border-radius: 10px !important;
-}
-[data-testid="stExpander"] summary, [data-testid="stExpander"] p { color: #93c5fd !important; }
-
-/* Code blocks */
-.stCodeBlock, pre, code { background: #0b1220 !important; color: #cbd5e1 !important; }
-
-/* Chat input */
-[data-testid="stChatInput"] textarea, [data-testid="stChatInput"] input {
-    background: #1e293b !important; color: #fff !important;
-    border: 1px solid #2e4a6e !important; border-radius: 12px !important;
-}
-[data-testid="stChatInput"] textarea::placeholder { color: #94a3b8 !important; }
-
-/* File uploader */
-[data-testid="stFileUploader"] {
-    background: #1e293b !important; border: 1px dashed #2e4a6e !important;
-    border-radius: 10px !important;
-}
-[data-testid="stFileUploader"] * { color: #e2e8f0 !important; }
-[data-testid="stFileUploader"] button {
-    background: #2563eb !important; color: #fff !important; border: none !important;
-}
-
-/* Alerts */
-[data-testid="stAlert"] * { color: #e2e8f0 !important; }
-
-/* Scrollbars */
-::-webkit-scrollbar       { width: 6px; }
-::-webkit-scrollbar-track { background: #0f1923; }
-::-webkit-scrollbar-thumb { background: #2e4a6e; border-radius: 3px; }
-
-/* Radio / select */
-[data-testid="stRadio"] label, [data-testid="stSelectbox"] label { color: #e2e8f0 !important; }
-
-hr { border-color: #1e3a5f !important; }
-
-/* Legend pills */
-.legend { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0; }
-.legend-pill {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 10px; border-radius: 16px; font-size: 0.75rem;
-    background: #1e293b; border: 1px solid #2e4a6e; color: #e2e8f0;
-}
-.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
-</style>
-""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,24 +135,72 @@ ANTHROPIC_API_KEY = get_cred("ANTHROPIC_API_KEY")
 
 # ── Embeddings (semantic search) ─────────────────────────────────────────────
 EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIMS  = 1536
-SEMANTIC_THRESHOLD = 0.70   # Neo4j cosine similarity in [0, 1] — only return ≥ 0.70
+EMBEDDING_DIMS  = 1536          # overridden below if HuggingFace fallback is used
+SEMANTIC_THRESHOLD = 0.70       # Neo4j cosine similarity in [0, 1] — only return ≥ 0.70
 
 
 @st.cache_resource(show_spinner=False)
 def _init_embedder():
-    if OpenAIEmbeddings is None or not OPENAI_API_KEY:
-        return None
-    try:
-        return OpenAIEmbeddings(
-            model=EMBEDDING_MODEL,
-            api_key=OPENAI_API_KEY,
-        )
-    except Exception:
-        return None
+    """
+    Priority 1: OpenAI text-embedding-3-small with truststore http client.
+      A live probe call confirms the endpoint is reachable before returning.
+    Priority 2: Local sentence-transformers all-MiniLM-L6-v2 (384 dims, no
+      network required).  Tried via langchain-huggingface, then
+      langchain-community, so whichever package is installed wins.
+
+    Returns (embedder_instance, embedding_dimension).
+    """
+    if OpenAIEmbeddings is not None and OPENAI_API_KEY:
+        try:
+            candidate = OpenAIEmbeddings(
+                model=EMBEDDING_MODEL,
+                api_key=OPENAI_API_KEY,
+                **_llm_kwargs(),
+            )
+            candidate.embed_query("probe")          # live connectivity test
+            return candidate, 1536
+        except Exception:
+            pass
+
+    # Local fallback — works fully offline / behind restrictive proxies
+    for _pkg, _cls in [
+        ("langchain_huggingface",          "HuggingFaceEmbeddings"),
+        ("langchain_community.embeddings", "HuggingFaceEmbeddings"),
+    ]:
+        try:
+            _mod = __import__(_pkg, fromlist=[_cls])
+            _HFE = getattr(_mod, _cls)
+            candidate = _HFE(model_name="all-MiniLM-L6-v2")
+            candidate.embed_query("probe")
+            return candidate, 384
+        except Exception:
+            continue
+
+    return None, 1536
 
 
-_embedder = _init_embedder()
+_result       = _init_embedder()
+_embedder     = _result[0]
+EMBEDDING_DIMS = _result[1]     # 1536 (OpenAI) or 384 (HuggingFace local)
+
+
+def _embed_with_retry(embed_text: str, max_attempts: int = 3) -> list | None:
+    """
+    Call _embedder.embed_query() with exponential backoff (1 s → 2 s → 4 s).
+    Returns the vector on success, or None after all attempts are exhausted.
+    """
+    if _embedder is None or not embed_text:
+        return None
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _embedder.embed_query(embed_text)
+        except Exception:
+            if attempt == max_attempts:
+                return None
+            time.sleep(delay)
+            delay *= 2
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -418,8 +369,8 @@ def init_chain(_graph):
     if _graph is None or not OPENAI_API_KEY:
         return None, "Graph or API key unavailable"
     try:
-        cypher_llm = ChatOpenAI(model="gpt-4o", temperature=0,   api_key=OPENAI_API_KEY)
-        qa_llm     = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=OPENAI_API_KEY)
+        cypher_llm = ChatOpenAI(model="gpt-4o", temperature=0,   api_key=OPENAI_API_KEY, **_llm_kwargs())
+        qa_llm     = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=OPENAI_API_KEY, **_llm_kwargs())
         chain = GraphCypherQAChain.from_llm(
             llm=qa_llm, graph=_graph,
             cypher_llm=cypher_llm,
@@ -560,6 +511,7 @@ def generate_human_label(text: str) -> str:
             temperature=0,
             api_key=OPENAI_API_KEY,
             max_tokens=20,
+            **_llm_kwargs(),
         )
         prompt = (
             "Given the following policy text, generate a concise, 2-3 word "
@@ -584,29 +536,72 @@ except ImportError:
     fitz = None
 
 
-PDF_TO_XML_SYSTEM = """You are a specialized Knowledge Engineering Agent. Your goal is to transform academic policy text (Bournemouth University Code of Practice) into a highly structured XML format that mirrors a Relational Knowledge Graph schema.
+PDF_TO_XML_SYSTEM = """You are a Knowledge Engineering Agent. Your sole task is to convert Bournemouth University policy text into strict hierarchical XML that feeds a Neo4j Knowledge Graph. Every element you emit is merged directly into a live production database — any generic placeholder or malformed tag will corrupt it permanently.
 
-TARGET XML SCHEMA REQUIREMENTS:
+════════════════════════════════════════════
+ABSOLUTE NAMING RULES  (no exceptions)
+════════════════════════════════════════════
+All id attributes MUST follow this compound format:
 
-<Rule> (Parent Node): Every major policy section must be a Rule.
-  Attributes: id (e.g., R5.1), label (short title), sourceSection (exact section number).
-  <Description>: A concise summary of the Rule's purpose.
+  Rule      →  R_{SectionNumber}
+               e.g. R_13   R_7_2
+  Condition →  C_{SectionNumber}_{DescriptiveSlug}
+               e.g. C_13_1_LawThesisWordLimit   C_7_2_MaxResubmissions
+  Outcome   →  O_{SectionNumber}_{DescriptiveSlug}
+               e.g. O_13_1_ExaminationBoardAward   O_7_2_WithdrawalSanction
 
-<Condition> (Child Node): Specific requirements or constraints under a Rule.
-  Attributes: id (e.g., C5.1.2), and if applicable: deadlineFT, deadlinePT, wordLimit.
+Rules:
+• SectionNumber = the exact section/subsection digits from the text (e.g. 13, 7.2, 4.1.3).
+  Replace dots with underscores: section 7.2 → "7_2".
+• DescriptiveSlug = PascalCase phrase (2–5 words) derived ONLY from the actual policy text.
+• FORBIDDEN id values: "Untitled", "Unknown", "C1", "O1", any single-letter+digit without
+  a section prefix, any empty string.
+• FORBIDDEN label values: "Untitled", "Unknown", any single word that does not name the
+  specific policy clause, any empty string.
+• Every label attribute MUST be a readable 2–7 word phrase a policy officer would recognise.
+• If you cannot derive a descriptive name from the text DO NOT emit the element at all.
 
-<Outcome> (Child Node): The result or consequence of satisfying (or failing) a condition.
-  Attributes: id (e.g., O5.1.1), type (e.g., requirement, sanction, award).
+════════════════════════════════════════════
+OUTPUT SCHEMA  (follow exactly)
+════════════════════════════════════════════
+<Rule id="R_{section}" label="{Descriptive Title 2-7 words}" sourceSection="{e.g. 13.1}">
+  <Description>{One sentence: what this rule governs.}</Description>
 
-<Conflict> (Logic Node): Identify sentences where policies overlap, contradict, or provide exceptions.
-  Attributes: from (Condition ID), to (Condition ID), scenario (The situation), resolution (Which rule wins?).
+  <Condition id="C_{section}_{Slug}" label="{Descriptive Condition Name}" parentRule="R_{section}"
+             deadlineFT="{value or omit attr}" deadlinePT="{value or omit attr}"
+             wordLimit="{value or omit attr}">
+    {Exact or closely paraphrased condition text from the document.}
+  </Condition>
 
-TASK INSTRUCTIONS:
-1. Analyze the provided text for hierarchical relationships.
-2. Detect "Risk Keywords" (e.g., withdrawal, failure, terminated) to ensure these nodes are correctly identified later by the system.
-3. Use consistent IDs (R for Rule, C for Condition, O for Outcome) with matching section numbers.
-4. Output ONLY raw XML. Do not include conversational text, markdown formatting (no ```xml fences), or explanations.
-5. Do NOT emit an XML prolog (<?xml ...?>) — emit only the <Rule> elements.
+  <Outcome id="O_{section}_{Slug}" label="{Descriptive Outcome Name}" parentRule="R_{section}"
+           type="{requirement|sanction|award|exception}">
+    {Exact or closely paraphrased outcome text from the document.}
+  </Outcome>
+
+  <Conflict from="C_{id}" to="C_{id}"
+            scenario="{exact conflicting situation}"
+            resolution="{which rule governs and why}"/>
+</Rule>
+
+Nesting rules:
+• <Condition> and <Outcome> MUST be direct children of their parent <Rule>.
+• Sub-sections each become their own <Rule> nested inside the parent <Rule>.
+• <Conflict> uses self-closing form; all other elements must be explicitly closed.
+
+════════════════════════════════════════════
+RISK KEYWORD DETECTION
+════════════════════════════════════════════
+If the text contains: withdrawal, failure, terminated, excluded, penalty, sanction,
+lapsed, void, rejected, resubmit — the enclosing <Outcome> MUST carry type="sanction".
+
+════════════════════════════════════════════
+OUTPUT RULES
+════════════════════════════════════════════
+1. Output ONLY raw XML — zero markdown, zero ```xml fences, zero <?xml?> prolog.
+2. Every opened tag must be explicitly closed. No truncation mid-element.
+3. Do NOT invent information absent from the text.
+4. Do NOT emit any element you cannot name specifically — omit it entirely.
+5. Anchor every id to the section numbers visible in THIS chunk's text.
 """
 
 
@@ -640,7 +635,136 @@ def _wrap_xml_fragment(xml_fragment: str) -> bytes:
         s = s.strip("`").strip()
     if s.lower().startswith("<?xml"):
         s = s.split("?>", 1)[-1].strip()
+
+    # Sanitise common LLM XML mistakes:
+    # 1. Unescaped & that aren't already part of a valid entity reference.
+    s = re.sub(r"&(?!(?:amp|lt|gt|apos|quot|#\d+|#x[\da-fA-F]+);)", "&amp;", s)
+    # 2. Strip non-XML control characters (U+0000–U+0008, U+000B–U+000C, U+000E–U+001F)
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+
     return f"<Policy>\n{s}\n</Policy>".encode("utf-8")
+
+
+def _chunk_text(text: str, chunk_size: int = 80_000, overlap: int = 2_000) -> list[str]:
+    """Split text into overlapping fixed-size chunks for LLM processing."""
+    if len(text) <= chunk_size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - overlap
+    return chunks
+
+
+def _merge_xml_fragments(raw_fragments: list[str], log_fn) -> str:
+    """
+    Merge chunk XML fragments into a single deduplicated body.
+
+    Strategy:
+    • Only top-level <Rule> elements are collected (direct children of the
+      fragment root).  Nested sub-Rules are carried along inside their parent
+      and are NOT double-counted.
+    • Deduplication key: tag + "::" + id  (compound section-aware IDs from the
+      new prompt make collisions between genuinely different elements impossible).
+    • If the SAME Rule id appears in two overlapping chunks, the later chunk's
+      unique <Condition> / <Outcome> children are merged into the first copy
+      rather than discarded.
+    • Elements with generic/Untitled ids or labels are rejected before merging.
+    """
+    import copy
+
+    _FORBIDDEN = {"untitled", "unknown", "unnamed", "n/a", "none", ""}
+    _BARE_ID   = re.compile(r"^[rco]\d{1,3}$", re.IGNORECASE)  # R1, C2, O12 …
+
+    def _is_generic(val: str) -> bool:
+        v = (val or "").strip().lower()
+        return v in _FORBIDDEN or bool(_BARE_ID.match(v))
+
+    def _sanitise(s: str) -> str:
+        if s.startswith("```"):
+            s = s.strip("`")
+            if s.lower().startswith("xml"):
+                s = s[3:]
+            s = s.strip("`").strip()
+        if s.lower().startswith("<?xml"):
+            s = s.split("?>", 1)[-1].strip()
+        s = re.sub(r"&(?!(?:amp|lt|gt|apos|quot|#\d+|#x[\da-fA-F]+);)", "&amp;", s)
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+        return s
+
+    # rule_id → deepcopy of the winning ET.Element
+    rule_registry: dict[str, ET.Element] = {}
+    # rule_id → set of "ChildTag::child_id" keys already inside that Rule
+    child_seen: dict[str, set[str]] = {}
+    skipped = 0
+    parse_errors = 0
+
+    for i, frag in enumerate(raw_fragments, 1):
+        s = _sanitise(frag.strip())
+        try:
+            wrapper = s if re.match(r"\s*<Policy[\s>]", s) else f"<root>{s}</root>"
+            frag_root = ET.fromstring(wrapper.encode("utf-8"))
+        except ET.ParseError as e:
+            parse_errors += 1
+            log_fn("warn", f"⚠ Fragment {i} failed to parse ({e}) — skipped.")
+            continue
+
+        # Walk only direct children (top-level Rules)
+        for rule_el in list(frag_root):
+            if rule_el.tag != "Rule":
+                continue
+            rid    = (rule_el.get("id") or "").strip()
+            rlabel = (rule_el.get("label") or "").strip()
+
+            if not rid or _is_generic(rid) or _is_generic(rlabel):
+                skipped += 1
+                continue
+
+            if rid not in rule_registry:
+                # First time: deepcopy the entire Rule subtree
+                cloned = copy.deepcopy(rule_el)
+                rule_registry[rid] = cloned
+                child_seen[rid] = set()
+                for child in cloned:
+                    if child.tag in ("Condition", "Outcome"):
+                        cid = (child.get("id") or "").strip()
+                        if cid and not _is_generic(cid):
+                            child_seen[rid].add(f"{child.tag}::{cid}")
+                        else:
+                            skipped += 1
+            else:
+                # Rule already registered: merge any new unique children
+                existing = rule_registry[rid]
+                for child in rule_el:
+                    if child.tag not in ("Condition", "Outcome"):
+                        continue
+                    cid    = (child.get("id") or "").strip()
+                    clabel = (child.get("label") or "").strip()
+                    if not cid or _is_generic(cid) or _is_generic(clabel):
+                        skipped += 1
+                        continue
+                    key = f"{child.tag}::{cid}"
+                    if key not in child_seen[rid]:
+                        child_seen[rid].add(key)
+                        existing.append(copy.deepcopy(child))
+
+    if parse_errors:
+        log_fn("warn", f"⚠ {parse_errors} fragment(s) could not be parsed and were skipped.")
+    if skipped:
+        log_fn("warn", f"⚠ Rejected {skipped} generic/Untitled element(s) during merge.")
+
+    log_fn("info",
+           f"✓ Merge complete: {len(rule_registry)} unique Rule(s) "
+           f"from {len(raw_fragments)} chunk(s).")
+
+    return "\n".join(
+        ET.tostring(rule_el, encoding="unicode")
+        for rule_el in rule_registry.values()
+    )
 
 
 def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
@@ -655,12 +779,13 @@ def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
     if not text:
         raise RuntimeError("No extractable text found in the PDF.")
 
-    # Truncate to a safe context window — most policy sections easily fit.
-    MAX_CHARS = 60_000
-    if len(text) > MAX_CHARS:
-        log_fn("warn",
-               f"⚠ PDF text is {len(text):,} chars — truncating to {MAX_CHARS:,}.")
-        text = text[:MAX_CHARS]
+    # Split into overlapping chunks — smaller chunks keep gpt-4o output valid.
+    CHUNK_SIZE = 15_000
+    CHUNK_OVERLAP = 1_500
+    chunks = _chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+    log_fn("info",
+           f"📄 PDF text is {len(text):,} chars — split into {len(chunks)} chunk(s) "
+           f"of ~{CHUNK_SIZE:,} chars (overlap {CHUNK_OVERLAP:,}).")
 
     # Pick the best available LLM
     llm = None
@@ -672,6 +797,7 @@ def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
                 temperature=0,
                 max_tokens=8000,
                 api_key=ANTHROPIC_API_KEY,
+                **_llm_kwargs(),
             )
             model_name = "claude-sonnet-4-6"
         except Exception as e:
@@ -685,18 +811,45 @@ def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
             temperature=0,
             max_tokens=8000,
             api_key=OPENAI_API_KEY,
+            **_llm_kwargs(),
         )
         model_name = "gpt-4o"
 
-    log_fn("info", f"🤖 Sending text to {model_name} for XML transformation...")
+    raw_fragments: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        chunk_label = f"chunk {i}/{len(chunks)}" if len(chunks) > 1 else "full document"
+        log_fn("info", f"🤖 Sending {chunk_label} ({len(chunk):,} chars) to {model_name}...")
+        prompt = (
+            PDF_TO_XML_SYSTEM
+            + f"\n\nCHUNK {i} OF {len(chunks)}: "
+            + "Derive all element IDs from section numbers visible in THIS chunk's text.\n\n"
+            + "Input Text to Process:\n"
+            + chunk
+        )
+        try:
+            resp = llm.invoke(prompt)
+        except Exception as llm_err:
+            import traceback as _tb
+            log_fn("err", f"LLM call failed on {chunk_label}: {type(llm_err).__name__}: {llm_err}")
+            log_fn("err", _tb.format_exc()[-600:])
+            raise
+        fragment = getattr(resp, "content", str(resp)) or ""
+        if not fragment.strip():
+            log_fn("warn", f"⚠ {chunk_label} returned empty XML — skipping.")
+            continue
+        log_fn("success", f"✓ {chunk_label}: received {len(fragment):,} chars of XML.")
+        raw_fragments.append(fragment)
 
-    prompt = (
-        PDF_TO_XML_SYSTEM
-        + "\n\nInput Text to Process:\n"
-        + text
-    )
-    resp = llm.invoke(prompt)
-    xml_fragment = getattr(resp, "content", str(resp)) or ""
+    if not raw_fragments:
+        raise RuntimeError("LLM returned empty XML for all chunks.")
+
+    if len(raw_fragments) == 1:
+        xml_fragment = raw_fragments[0]
+    else:
+        log_fn("info", f"🔗 Merging {len(raw_fragments)} XML fragments (deduplicating by element id)...")
+        xml_fragment = _merge_xml_fragments(raw_fragments, log_fn)
+        log_fn("success", f"✓ Merged XML: {len(xml_fragment):,} chars total.")
+
     if not xml_fragment.strip():
         raise RuntimeError("LLM returned an empty XML fragment.")
 
@@ -709,6 +862,12 @@ def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
         ET.fromstring(xml_bytes)
     except ET.ParseError as e:
         log_fn("err", f"LLM XML did not parse: {e}")
+        # Show the offending line to aid debugging
+        lines = xml_bytes.decode("utf-8", errors="replace").splitlines()
+        if hasattr(e, "position"):
+            bad_line = e.position[0]  # 1-based
+            snippet = lines[bad_line - 1] if bad_line <= len(lines) else "(out of range)"
+            log_fn("err", f"Offending line {bad_line}: {snippet[:200]}")
         raise
     log_fn("success", "✓ XML parsed cleanly — ready for Neo4j ingestion.")
     return xml_bytes
@@ -766,6 +925,14 @@ def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
             stats["errors"] += 1
             return False
 
+    # ── Wipe all existing graph data before fresh ingestion ─────────────────
+    log_fn("info", "🗑  Wiping existing graph data for clean ingestion...")
+    try:
+        graph.query("MATCH (n) DETACH DELETE n")
+        log_fn("success", "✓ All existing nodes and relationships deleted.")
+    except Exception as _wipe_err:
+        log_fn("warn", f"⚠ Could not wipe graph: {_wipe_err}")
+
     # ── Policy root node ─────────────────────────────────────────────────────
     run(
         """
@@ -776,26 +943,30 @@ def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
     )
     log_fn("success", f"✓ Policy node created / updated: {pid}")
 
-    # ── Vector index bootstrap (idempotent, runs once per ingest) ───────────
+    # ── Vector index bootstrap (DROP + CREATE to handle dimension changes) ────
     if _embedder is not None:
         try:
+            graph.query("DROP INDEX rule_text_index IF EXISTS")
             graph.query(f"""
-            CREATE VECTOR INDEX rule_text_index IF NOT EXISTS
+            CREATE VECTOR INDEX rule_text_index
             FOR (r:Rule) ON (r.embedding)
             OPTIONS {{indexConfig: {{
               `vector.dimensions`: {EMBEDDING_DIMS},
               `vector.similarity_function`: 'cosine'
             }}}}
             """)
+            graph.query("DROP INDEX condition_text_index IF EXISTS")
             graph.query(f"""
-            CREATE VECTOR INDEX condition_text_index IF NOT EXISTS
+            CREATE VECTOR INDEX condition_text_index
             FOR (c:Condition) ON (c.embedding)
             OPTIONS {{indexConfig: {{
               `vector.dimensions`: {EMBEDDING_DIMS},
               `vector.similarity_function`: 'cosine'
             }}}}
             """)
-            log_fn("success", "✓ Vector indices ready (rule_text_index, condition_text_index).")
+            log_fn("success",
+                   f"✓ Vector indices created ({EMBEDDING_DIMS}-dim cosine): "
+                   "rule_text_index, condition_text_index.")
         except Exception as e:
             log_fn("warn", f"Vector index creation failed (will skip embedding): {e}")
 
@@ -836,15 +1007,15 @@ def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
         if _embedder is not None:
             embed_text = " · ".join(t for t in (rlabel_human, rlabel, rdesc) if t)
             if embed_text:
-                try:
-                    vec = _embedder.embed_query(embed_text)
+                vec = _embed_with_retry(embed_text)
+                if vec is not None:
                     run(
                         "MATCH (r:Rule {id:$id, policy_id:$pid}) "
                         "SET r.embedding = $vec",
                         {"id": rid, "pid": pid, "vec": vec},
                     )
-                except Exception as e:
-                    log_fn("warn", f"Embedding failed for Rule {rid}: {e}")
+                else:
+                    log_fn("err", f"⚠ Embedding failed after 3 attempts for Rule {rid} — node stored without vector")
 
         # Conditions
         for cond_el in rule_el.iter("Condition"):
@@ -878,15 +1049,15 @@ def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
             if _embedder is not None:
                 embed_text = " · ".join(t for t in (clabel_human, ctext) if t)
                 if embed_text:
-                    try:
-                        vec = _embedder.embed_query(embed_text)
+                    vec = _embed_with_retry(embed_text)
+                    if vec is not None:
                         run(
                             "MATCH (c:Condition {id:$id, policy_id:$pid}) "
                             "SET c.embedding = $vec",
                             {"id": cid, "pid": pid, "vec": vec},
                         )
-                    except Exception as e:
-                        log_fn("warn", f"Embedding failed for Condition {cid}: {e}")
+                    else:
+                        log_fn("err", f"⚠ Embedding failed after 3 attempts for Condition {cid} — node stored without vector")
 
             if run(
                 """
@@ -1498,19 +1669,25 @@ def render_legend(highlight_path: bool = False):
         (COLOR_OUTCOME,   "Outcome"),
         (COLOR_CONFLICT,  "Conflict / Risk"),
     ]
-    pills = "".join(
-        f'<span class="legend-pill">'
-        f'<span class="legend-dot" style="background:{c}"></span>{lbl}</span>'
-        for c, lbl in items
-    )
     if highlight_path:
-        pills += (
-            f'<span class="legend-pill">'
-            f'<span class="legend-dot" style="background:{COLOR_PATH};'
-            f'box-shadow:0 0 6px {COLOR_PATH}"></span>'
-            f'AI reasoning path</span>'
+        items.append((COLOR_PATH, "AI reasoning path"))
+
+    pill_parts = []
+    for c, lbl in items:
+        glow = f"box-shadow:0 0 5px {c};" if c == COLOR_PATH else ""
+        pill_parts.append(
+            f'<span style="display:inline-flex;align-items:center;gap:5px;'
+            f'margin-right:6px;font-size:0.82rem;">'
+            f'<span style="width:10px;height:10px;border-radius:50%;'
+            f'background:{c};display:inline-block;{glow}"></span>'
+            f'{lbl}</span>'
         )
-    st.markdown(f'<div class="legend">{pills}</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="display:flex;flex-wrap:wrap;gap:4px;margin:4px 0 10px 0;">'
+        + "".join(pill_parts)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1617,7 +1794,44 @@ _STOPWORDS = {
     "what", "when", "where", "who", "how", "why", "which", "that", "this",
     "my", "me", "i", "we", "you", "your", "our", "us", "it", "its",
     "not", "no", "yes", "any", "all", "some", "about",
+    # Pipeline/framework terms — must never become CONTAINS keywords
+    "crag", "gate", "route", "routing", "relevance", "relevant", "irrelevant",
+    "ambiguous", "fusion", "adaptive", "pipeline", "fallback", "threshold",
+    "cypher", "neo4j", "graph", "node", "embedding", "vector", "score",
+    "quality", "audit", "trail", "retrieved", "retrieval", "context",
+    "reasoning", "lookup", "direct", "complex",
 }
+
+# Patterns that indicate UI/framework text has leaked into the raw input string.
+_UI_LEAK_RE = re.compile(
+    r"(crag\s+quality|quality\s+gate|adaptive\s+route|fusion\s+rag|"
+    r"audit\s+trail|policy\s+context\s+(irrelevant|ambiguous)|"
+    r"providing\s+standard\s+fallback|knowledge\s+graph\s+platform)",
+    re.IGNORECASE,
+)
+
+
+def _clean_user_query(raw: str) -> str:
+    """
+    Return ONLY the user-typed question, with no UI/framework text attached.
+
+    Strips leading/trailing whitespace.  For multi-line input, drops any line
+    that matches known pipeline-output patterns (CRAG status, route badges,
+    audit-trail labels).  Falls back to the original stripped string if all
+    lines would be removed, so the function never returns empty when the raw
+    input is non-empty.
+    """
+    q = (raw or "").strip()
+    if not q:
+        return q
+    lines = q.splitlines()
+    if len(lines) == 1:
+        # Single-line: strip but don't drop — trust the user typed it
+        return q
+    clean = [ln for ln in lines if not _UI_LEAK_RE.search(ln)]
+    result = " ".join(clean).strip()
+    return result if result else q
+
 
 def _keywords(question: str, top_k=5):
     """Extract a handful of content keywords from the question."""
@@ -1664,33 +1878,65 @@ def generate_search_variants(question: str, n: int = 4) -> list[str]:
 
 def _semantic_search(graph, question: str, top_k: int = 8,
                      threshold: float = SEMANTIC_THRESHOLD,
-                     score_window: int = 12):
+                     score_window: int = 12,
+                     use_fusion: bool = True):
     """
-    Vector-based semantic search across Rule and Condition embeddings.
+    Adaptive Fusion RAG semantic search across Rule and Condition embeddings.
 
-    Returns (cypher_str, rows, scores). `scores` is the list of
-        {"label": str, "id": str, "score": float, "kept": bool}
-    for the top `score_window` candidates *before* threshold filtering, so
-    the UI can render a transparency bar chart showing which nodes were
-    above and below the cut.
+    use_fusion=True  (COMPLEX_REASONING):
+      Multi-query expansion → embed N variants → per-variant vector retrieval →
+      RRF across N ranked lists → cosine threshold → top-k.
+
+    use_fusion=False (DIRECT_LOOKUP):
+      Hybrid dual-stream RRF:
+        Stream A — single-vector similarity (cosine)
+        Stream B — keyword CONTAINS scored by match count
+      Both streams feed RRF; nodes matching both signals jump to the top.
+      Filtered to strict top-5 by RRF score (no cosine threshold cut for
+      keyword-only hits, preventing domain nodes from being dropped).
     """
     if _embedder is None or graph is None or not (question or "").strip():
         return None, [], []
 
-    queries = [question.strip()] + generate_search_variants(question, n=4)
+    # ── Step 1: Query expansion / keyword extraction ──────────────────────────
+    if use_fusion:
+        fusion_variants = generate_multiple_queries(question.strip(), num_queries=3)
+        queries = [question.strip()] + [v for v in fusion_variants
+                                         if v.strip() and v.strip() != question.strip()]
+        direct_kws: list[str] = []
+    else:
+        queries = [question.strip()]
+        # Domain-anchored keywords to bias the keyword stream toward specific chapters.
+        _DOMAIN_KWS = {
+            "word", "limit", "words", "maximum", "minimum", "thesis",
+            "chapter", "submit", "submission", "deadline", "resubmit",
+            "withdrawal", "examination", "viva", "award", "penalty",
+            "fail", "failure", "sanction", "appendix", "abstract",
+        }
+        q_lower = question.lower()
+        hard_kws = [kw for kw in _DOMAIN_KWS if kw in q_lower]
+        soft_kws = [
+            re.sub(r"[^a-z0-9]", "", w)
+            for w in re.findall(r"[A-Za-z]{4,}", q_lower)
+            if w not in _STOPWORDS
+        ]
+        direct_kws = list(dict.fromkeys(hard_kws + soft_kws))[:8]
+        direct_kws = [k for k in direct_kws if k]
 
     try:
         vectors = _embedder.embed_documents(queries)
     except Exception:
         return None, [], []
 
-    # Aggregate hits across all variants — keep the max similarity per node.
-    # We retrieve UNFILTERED hits so the chart can show "below threshold" too.
-    matches: dict[tuple[str, str], float] = {}   # (label, id) -> score
+    # ── Step 2: Vector retrieval (both modes) ─────────────────────────────────
+    max_sim: dict[tuple[str, str], float] = {}
+    per_query_rankings: list[list[str]] = []
+
     for vec in vectors:
+        query_hits: list[tuple[str, str, float]] = []
         for idx_name in ("rule_text_index", "condition_text_index"):
             try:
-                rows = graph.query(
+                idx_rows = graph.query(
                     """
                     CALL db.index.vector.queryNodes($idx, $k, $vec)
                     YIELD node, score
@@ -1699,35 +1945,112 @@ def _semantic_search(graph, question: str, top_k: int = 8,
                     {"idx": idx_name, "k": score_window, "vec": vec},
                 )
             except Exception:
-                rows = []
-            for r in rows:
-                key = (r.get("label"), r.get("id"))
-                if not key[1]:
+                idx_rows = []
+            for r in idx_rows:
+                label, nid, sc = r.get("label"), r.get("id"), float(r.get("score", 0))
+                if not nid:
                     continue
-                prev = matches.get(key, 0.0)
-                if r.get("score", 0.0) > prev:
-                    matches[key] = float(r["score"])
+                query_hits.append((label, nid, sc))
+                key = (label, nid)
+                if sc > max_sim.get(key, 0.0):
+                    max_sim[key] = sc
 
-    if not matches:
+        query_hits.sort(key=lambda t: -t[2])
+        per_query_rankings.append([t[1] for t in query_hits])
+
+    # ── Step 2b: Keyword stream — DIRECT_LOOKUP only ─────────────────────────
+    if not use_fusion and direct_kws:
+        try:
+            kw_rows = graph.query(
+                """
+                MATCH (n)
+                WHERE (n:Rule OR n:Condition)
+                WITH n,
+                     [kw IN $kws
+                      WHERE toLower(
+                        coalesce(n.description,  '') + ' ' +
+                        coalesce(n.label,         '') + ' ' +
+                        coalesce(n.text,          '') + ' ' +
+                        coalesce(n.label_human,   '')
+                      ) CONTAINS kw] AS matched
+                WHERE size(matched) > 0
+                RETURN labels(n)[0] AS label, n.id AS id,
+                       toFloat(size(matched)) AS score
+                ORDER BY score DESC
+                LIMIT $k
+                """,
+                {"kws": direct_kws, "k": score_window},
+            )
+        except Exception:
+            kw_rows = []
+
+        stream_b: list[tuple[str, str, float]] = []
+        for r in kw_rows:
+            label, nid, sc = r.get("label"), r.get("id"), float(r.get("score", 0))
+            if not nid:
+                continue
+            stream_b.append((label, nid, sc))
+            key = (label, nid)
+            # Preserve cosine if vector already scored this node; otherwise 0.0
+            # so it still appears in the transparency chart with its RRF rank.
+            if key not in max_sim:
+                max_sim[key] = 0.0
+
+        stream_b.sort(key=lambda t: -t[2])
+        per_query_rankings.append([t[1] for t in stream_b])
+
+    if not max_sim:
         return None, [], []
 
-    # Build the transparency record (score chart input) — top score_window
-    # by score, with a `kept` flag reflecting the SEMANTIC_THRESHOLD cut.
-    scored = sorted(matches.items(), key=lambda kv: -kv[1])[:score_window]
-    scores = [
-        {"label": k[0], "id": k[1], "score": float(s), "kept": s >= threshold}
-        for (k, s) in scored
-    ]
+    # ── Step 3: Reciprocal Rank Fusion across all streams ────────────────────
+    rrf_scores_raw = dict(reciprocal_rank_fusion(per_query_rankings, k=60))
 
-    # Apply the threshold for the actual retrieval — top-k of the kept set.
-    kept = [(k, s) for (k, s) in scored if s >= threshold][:top_k]
-    if not kept:
+    # ── Step 4: Transparency record (kept flag uses RRF rank for direct mode) ─
+    all_keys = sorted(
+        max_sim.keys(),
+        key=lambda kv: (-rrf_scores_raw.get(kv[1], 0.0), -max_sim[kv]),
+    )[:score_window]
+
+    if not use_fusion:
+        # Direct: kept = top-5 by RRF regardless of cosine (keyword hits are valid)
+        direct_top5_ids = {k[1] for k in all_keys[:5]}
+        scores = [
+            {
+                "label": k[0],
+                "id":    k[1],
+                "score": float(max_sim[k]),
+                "rrf":   float(rrf_scores_raw.get(k[1], 0.0)),
+                "kept":  k[1] in direct_top5_ids,
+            }
+            for k in all_keys
+        ]
+    else:
+        scores = [
+            {
+                "label": k[0],
+                "id":    k[1],
+                "score": float(max_sim[k]),
+                "rrf":   float(rrf_scores_raw.get(k[1], 0.0)),
+                "kept":  max_sim[k] >= threshold,
+            }
+            for k in all_keys
+        ]
+
+    # ── Step 5: Select kept nodes ─────────────────────────────────────────────
+    if not use_fusion:
+        # Strict top-5 by RRF — no cosine threshold so keyword-only hits survive
+        kept_keys = [(k, max_sim[k]) for k in all_keys[:5]]
+    else:
+        kept_keys = [
+            (k, max_sim[k]) for k in all_keys if max_sim[k] >= threshold
+        ][:top_k]
+
+    if not kept_keys:
         return None, [], scores
 
-    rule_ids = [k[1] for (k, _) in kept if k[0] == "Rule"]
-    cond_ids = [k[1] for (k, _) in kept if k[0] == "Condition"]
+    rule_ids = [k[1] for (k, _) in kept_keys if k[0] == "Rule"]
+    cond_ids = [k[1] for (k, _) in kept_keys if k[0] == "Condition"]
 
-    # Pull full surrounding context — same row shape the QA prompt expects.
     cypher = """
     MATCH (r:Rule)-[:BELONGS_TO]->(p:Policy)
     WHERE r.id IN $rule_ids
@@ -1757,13 +2080,25 @@ def _semantic_search(graph, question: str, top_k: int = 8,
     except Exception:
         rows = []
 
+    n_streams = len(per_query_rankings)
+    if not use_fusion:
+        mode = (
+            f"Adaptive RAG · Direct Lookup "
+            f"(hybrid {n_streams}-stream RRF, top-5, kws={direct_kws})"
+        )
+    elif _FUSION_RAG_AVAILABLE:
+        mode = f"Adaptive RAG · Complex Reasoning (Fusion RAG, {len(queries)} queries)"
+    else:
+        mode = "semantic"
+
     annotated_cypher = (
-        f"-- semantic fallback ({len(queries)} variants, threshold={threshold}) --\n"
-        f"-- variants: {queries}\n"
-        f"-- top hits (label,id → score):\n"
+        f"-- {mode} | RRF k=60 | threshold={threshold} --\n"
+        f"-- queries: {queries}\n"
+        f"-- top hits (label, id → cosine | rrf):\n"
         + "\n".join(
-            f"--   ({s['label']}, {s['id']}) → {s['score']:.3f}"
-            f"{'  ✓ kept' if s['kept'] else '  ✗ below threshold'}"
+            f"--   ({s['label']}, {s['id']}) → "
+            f"cosine={s['score']:.3f} | rrf={s['rrf']:.4f}"
+            f"{'  ✓ kept' if s['kept'] else '  ✗ dropped'}"
             for s in scores
         )
         + "\n"
@@ -1772,10 +2107,13 @@ def _semantic_search(graph, question: str, top_k: int = 8,
     return annotated_cypher, rows, scores
 
 
-def keyword_fallback_search(graph, question):
+def keyword_fallback_search(graph, question, use_fusion: bool = True):
     """
     Hybrid fallback used when the structured Cypher chain returns nothing.
     Tries semantic vector search first; falls back to legacy CONTAINS.
+
+    use_fusion is forwarded to _semantic_search(): False skips multi-query
+    expansion (Adaptive RAG DIRECT_LOOKUP path).
 
     Returns (cypher, rows, semantic_scores). `semantic_scores` is the list
     of top candidates with kept/below-threshold flags (or [] if semantic
@@ -1786,7 +2124,7 @@ def keyword_fallback_search(graph, question):
 
     # 1. Semantic first
     if _embedder is not None:
-        cypher, rows, scores = _semantic_search(graph, question)
+        cypher, rows, scores = _semantic_search(graph, question, use_fusion=use_fusion)
         if rows:
             return cypher, rows, scores
         # Even if semantic returned no kept rows, the candidate scores may
@@ -1797,7 +2135,16 @@ def keyword_fallback_search(graph, question):
         cached_scores = []
 
     # 2. Legacy keyword (CONTAINS) fallback — works even without embeddings
-    kws = _keywords(question)
+    if use_fusion:
+        # Full pipeline: use the shared keyword extractor (stopword-filtered)
+        kws = _keywords(question)
+    else:
+        # Direct Lookup: strict re-tokenisation of the isolated user string —
+        # no generation module, no derived text, minimum 4-char alpha tokens.
+        kws = [
+            w for w in re.findall(r"[A-Za-z]{4,}", question.lower())
+            if w not in _STOPWORDS
+        ][:6]
     if not kws:
         return None, [], cached_scores
     clause = " OR ".join(
@@ -1837,7 +2184,7 @@ def _ground_answer_from_rows(question, rows):
     """Generate a grounded answer directly from a rows list using QA_PROMPT."""
     if not OPENAI_API_KEY:
         return "LLM unavailable."
-    qa = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=OPENAI_API_KEY)
+    qa = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=OPENAI_API_KEY, **_llm_kwargs())
     context = str(rows[:25])
     prompt = QA_PROMPT.format(context=context, question=question)
     return qa.invoke(prompt).content
@@ -1853,6 +2200,7 @@ def _init_narrator():
             return ChatAnthropic(
                 model="claude-haiku-4-5-20251001",
                 temperature=0.2,
+                **_llm_kwargs(),
                 max_tokens=120,
                 api_key=ANTHROPIC_API_KEY,
             )
@@ -1864,6 +2212,7 @@ def _init_narrator():
             temperature=0.2,
             max_tokens=120,
             api_key=OPENAI_API_KEY,
+            **_llm_kwargs(),
         )
     return None
 
@@ -1969,12 +2318,34 @@ def extract_active_policy_ids(raw_rows) -> set:
     return pids
 
 
+_CRAG_REFUSAL = (
+    "**Policy context {status}** — the retrieved policy nodes do not contain "
+    "sufficient information to answer this question reliably. "
+    "Providing standard fallback search...\n\n"
+    "_Please consult the BU Doctoral College directly, or try rephrasing "
+    "your question with more specific policy terms._"
+)
+
+
 def run_query(question, chain):
+    # ── Isolate the exact user string — strip whitespace and any UI leakage ──
+    question = _clean_user_query(question)
+
     cypher = "N/A"
     raw = []
     used_fallback = False
     semantic_scores = []
+    crag_status = "RELEVANT"
+    crag_reason = "Not evaluated"
+    route = "COMPLEX_REASONING"
+    route_reason = "Not evaluated"
     try:
+        # ── Adaptive RAG: classify query complexity before any retrieval ──────
+        routing = _route_query(question)
+        route        = routing["route"]
+        route_reason = routing["reason"]
+        use_fusion   = (route == "COMPLEX_REASONING")
+
         result = chain.invoke({"query": question})
         steps = result.get("intermediate_steps", [])
         cypher = steps[0].get("query", "N/A") if steps else "N/A"
@@ -1986,22 +2357,46 @@ def run_query(question, chain):
         saying_unavailable = "not available in the current policy graph" in answer.lower()
 
         if empty_result or saying_unavailable:
-            fb_cypher, fb_rows, fb_scores = keyword_fallback_search(graph, question)
+            # Pass the clean question explicitly so keyword extraction is never
+            # contaminated by annotated cypher strings or prior answer text.
+            fb_cypher, fb_rows, fb_scores = keyword_fallback_search(
+                graph, question, use_fusion=use_fusion,
+            )
             semantic_scores = fb_scores or []
             if fb_rows:
-                answer = _ground_answer_from_rows(question, fb_rows)
-                cypher = f"-- Primary returned empty; keyword fallback used --\n{fb_cypher}"
+                # ── CRAG: validate fallback context BEFORE generating answer ─
+                crag = evaluate_context_relevance(fb_rows, question)
+                crag_status = crag["status"]
+                crag_reason = crag["reason"]
+                if crag_status == "RELEVANT":
+                    answer = _ground_answer_from_rows(question, fb_rows)
+                else:
+                    answer = _CRAG_REFUSAL.format(status=crag_status.lower())
+                cypher = (
+                    f"-- Primary returned empty; Fusion/keyword fallback used "
+                    f"[CRAG: {crag_status}] --\n{fb_cypher}"
+                )
                 raw    = fb_rows
                 used_fallback = True
+            else:
+                # Nothing found at all — mark IRRELEVANT without calling LLM
+                crag_status = "IRRELEVANT"
+                crag_reason = "No matching policy context found after fallback search."
+        else:
+            # ── CRAG: post-hoc quality gate on the primary chain result ──────
+            # The QA prompt already guards against hallucination, but CRAG gives
+            # an independent signal Sofia can see in the audit trail.
+            crag = evaluate_context_relevance(raw, question)
+            crag_status = crag["status"]
+            crag_reason = crag["reason"]
+            if crag_status != "RELEVANT":
+                answer = _CRAG_REFUSAL.format(status=crag_status.lower())
 
         # ── Active policy scope: which policies did the retrieval touch? ────
         active_policy_ids = extract_active_policy_ids(raw)
 
         # ── Node IDs: ONLY those explicitly mentioned in the LLM's answer ───
         answer_ids = extract_ids_from_text(answer)
-        # Also resolve bare section refs like "§5.1.2" → node IDs via sourceSection,
-        # scoped to the policies the retrieval actually touched so §5.1.2 from
-        # one document can never drag in a §5.1.2 from an unrelated policy.
         cited_sections = extract_sections_from_text(answer)
         section_ids = resolve_section_refs_to_ids(
             graph, cited_sections, policy_ids=active_policy_ids,
@@ -2009,22 +2404,34 @@ def run_query(question, chain):
         node_ids = answer_ids | section_ids
 
         return {
-            "answer": answer,
-            "cypher": cypher,
-            "raw": raw,
-            "node_ids": node_ids,
-            "policy_ids": active_policy_ids,
-            "used_fallback": used_fallback,
+            "answer":          answer,
+            "cypher":          cypher,
+            "raw":             raw,
+            "node_ids":        node_ids,
+            "policy_ids":      active_policy_ids,
+            "used_fallback":   used_fallback,
             "semantic_scores": semantic_scores,
-            "error": None,
+            "crag_status":     crag_status,
+            "crag_reason":     crag_reason,
+            "route":           route,
+            "route_reason":    route_reason,
+            "error":           None,
         }
     except Exception as e:
-        return {"answer": f"⚠️ Error: {e}", "cypher": cypher,
-                "raw": raw, "node_ids": set(),
-                "policy_ids": set(),
-                "used_fallback": used_fallback,
-                "semantic_scores": semantic_scores,
-                "error": str(e)}
+        return {
+            "answer":          f"⚠️ Error: {e}",
+            "cypher":          cypher,
+            "raw":             raw,
+            "node_ids":        set(),
+            "policy_ids":      set(),
+            "used_fallback":   used_fallback,
+            "semantic_scores": semantic_scores,
+            "crag_status":     crag_status,
+            "crag_reason":     crag_reason,
+            "route":           route,
+            "route_reason":    route_reason,
+            "error":           str(e),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2197,7 +2604,15 @@ _init_state()
 # 9.  INITIALISE RESOURCES
 # ─────────────────────────────────────────────────────────────────────────────
 graph, neo4j_err = init_neo4j()
+# Never let a failed attempt stick: st.cache_resource would otherwise pin the
+# (None, error) tuple for the whole server lifetime, so a paused/cold-starting
+# AuraDB instance would read "Offline" forever even after it comes back. Clear
+# the cache on failure so the next rerun (or the Reconnect button) retries live.
+if graph is None:
+    init_neo4j.clear()
 chain, chain_err = init_chain(graph) if graph else (None, "Neo4j unavailable")
+if chain is None and graph is not None:
+    init_chain.clear()
 total_nodes = count_nodes(graph) if graph else 0
 
 
@@ -2205,45 +2620,31 @@ total_nodes = count_nodes(graph) if graph else 0
 # 10. SIDEBAR — Status dashboard + data mgmt + graph controls
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("""
-    <div style="text-align:center; padding: 8px 0 16px 0;">
-        <div style="font-size:2.4rem;">🎓</div>
-        <div style="font-weight:700; font-size:1.05rem; color:#60a5fa;">
-            BU Policy GraphRAG
-        </div>
-        <div style="font-size:0.72rem; color:#64748b;">
-            Transparent Knowledge Platform
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("## 🎓 BU Policy GraphRAG")
+    st.caption("Transparent Knowledge Platform · MSc Data Science & AI · BU 2025")
+    st.divider()
 
     # ── System Status Dashboard ─────────────────────────────────────────────
-    st.markdown('<div class="sidebar-section">System Status</div>', unsafe_allow_html=True)
-
-    neo_cls, neo_val = ("ok", "Connected") if graph else ("err", "Offline")
-    api_cls, api_val = ("ok", "Ready")     if OPENAI_API_KEY else ("warn", "Missing")
-    chain_cls, chain_val = ("ok", "Ready") if chain else ("err", "Not Ready")
-
-    st.markdown(f"""
-      <div class="metric-card {neo_cls}">
-        <span class="label">Neo4j</span><span class="value">{neo_val}</span>
-      </div>
-      <div class="metric-card {api_cls}">
-        <span class="label">OpenAI API</span><span class="value">{api_val}</span>
-      </div>
-      <div class="metric-card {chain_cls}">
-        <span class="label">GraphRAG Chain</span><span class="value">{chain_val}</span>
-      </div>
-      <div class="metric-card">
-        <span class="label">Total Nodes</span><span class="value">{total_nodes}</span>
-      </div>
-    """, unsafe_allow_html=True)
-
+    st.markdown("**System Status**")
+    sc1, sc2 = st.columns(2)
+    sc1.metric("Neo4j", "🟢 Live" if graph else "🔴 Offline")
+    sc2.metric("GraphRAG", "🟢 Ready" if chain else "🔴 Off")
+    st.metric(
+        "OpenAI API",
+        "🟢 Ready" if OPENAI_API_KEY else "🟡 Missing",
+        f"{total_nodes} nodes in graph",
+    )
     if neo4j_err and not graph:
-        st.caption(neo4j_err[:140])
+        st.caption(f"⚠ {neo4j_err[:120]}")
+    if not graph or not chain:
+        if st.button("🔄 Reconnect", use_container_width=True):
+            init_neo4j.clear()
+            init_chain.clear()
+            st.rerun()
+    st.divider()
 
     # ── Data Management ─────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-section">Data Management</div>', unsafe_allow_html=True)
+    st.markdown("**Data Management**")
 
     # Policy metadata — applies to BOTH uploaders so every ingestion lives
     # inside its own (:Policy) namespace and never confuses rules across
@@ -2289,11 +2690,7 @@ with st.sidebar:
                 st.error(f"Ingestion failed: {e}")
 
     # ── PDF → XML automated pipeline ────────────────────────────────────────
-    st.markdown(
-        "<div style='font-size:0.78rem; color:#94a3b8; margin-top:10px; "
-        "margin-bottom:4px;'>Automated PDF Pipeline</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("**Automated PDF Pipeline**")
     pdf_file = st.file_uploader("Upload PDF Policy Document", type=["pdf"],
                                 label_visibility="collapsed", key="pdf_uploader")
     if pdf_file and st.button("⚡ Process & Ingest PDF", use_container_width=True,
@@ -2305,12 +2702,24 @@ with st.sidebar:
         elif not (ANTHROPIC_API_KEY or OPENAI_API_KEY):
             st.error("No LLM API key available for PDF transformation.")
         else:
-            st.session_state.ingest_log = []
-            def pdf_logger(level, msg):
-                st.session_state.ingest_log.append((level, msg))
             try:
+                st.session_state.ingest_log = []
+                _chunk_status = st.empty()
+
+                def pdf_logger(level, msg):
+                    st.session_state.ingest_log.append((level, msg))
+                    # Surface chunk-level progress immediately so the user can
+                    # see which chunk stalled without waiting for rerun.
+                    if level == "info" and (
+                        "chunk" in msg.lower() or "split into" in msg.lower()
+                    ):
+                        _chunk_status.info(msg)
+                    elif level == "err":
+                        _chunk_status.error(msg)
+
                 with st.spinner("Extracting PDF → XML → Neo4j…"):
                     xml_bytes = process_pdf_to_xml(pdf_file, pdf_logger)
+                    _chunk_status.empty()
                     stats = ingest_xml_to_neo4j(
                         xml_bytes, graph, pdf_logger,
                         policy_title=policy_title_input.strip(),
@@ -2320,14 +2729,16 @@ with st.sidebar:
                 init_chain.clear()
                 st.rerun()
             except Exception as e:
-                pdf_logger("err", str(e))
-                st.error(f"PDF pipeline failed: {e}")
+                import traceback as _tb
+                _full_tb = _tb.format_exc()
+                st.session_state.ingest_log.append(("err", str(e)))
+                st.error(f"Ingestion Aborted: {e}")
+                with st.expander("Full traceback", expanded=True):
+                    st.code(_full_tb, language="python")
 
     # ── Policy Management ───────────────────────────────────────────────────
-    st.markdown(
-        '<div class="sidebar-section">Policy Management</div>',
-        unsafe_allow_html=True,
-    )
+    st.divider()
+    st.markdown("**Policy Management**")
     policies = fetch_policies(graph) if graph else []
 
     if not graph:
@@ -2379,10 +2790,8 @@ with st.sidebar:
                         st.rerun()
 
     # ── 🏆 RAGas Benchmarking ───────────────────────────────────────────────
-    st.markdown(
-        '<div class="sidebar-section">🏆 RAGas Benchmarking</div>',
-        unsafe_allow_html=True,
-    )
+    st.divider()
+    st.markdown("**🏆 RAGas Benchmarking**")
     if not EVAL_DATASET:
         st.caption(
             "Gold dataset (evaluation_dataset.py) not found — benchmarking disabled."
@@ -2417,7 +2826,8 @@ with st.sidebar:
                 st.rerun()
 
     # ── Graph View Toggle ───────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-section">Graph Visualisation</div>', unsafe_allow_html=True)
+    st.divider()
+    st.markdown("**Graph Visualisation**")
     st.session_state.show_full_graph = st.checkbox(
         "Show full Knowledge Graph", value=st.session_state.show_full_graph,
     )
@@ -2459,45 +2869,72 @@ with st.sidebar:
         st.session_state.last_policy_ids = set()
         st.rerun()
 
-    st.markdown(
-        "<div style='font-size:0.7rem; color:#374151; text-align:center; margin-top:18px;'>"
-        "Allen Sharafzad · MSc Data Science & AI · BU 2025</div>",
-        unsafe_allow_html=True,
-    )
+    st.caption("Allen Sharafzad · MSc Data Science & AI · BU 2025")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11. MAIN AREA
+# 11. MAIN AREA — Trust & Live Analytics Dashboard
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="title-bar">
-    <span style="font-size:1.6rem;">🎓</span>
-    <div>
-        <h1>BU Policy GraphRAG Platform</h1>
-        <span>Transparent Knowledge Management & Reasoning · Every answer traceable to the graph</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+import ast as _ast
+
+st.title("🎓 BU Policy GraphRAG Platform")
+st.caption(
+    "Transparent Knowledge Management & Reasoning · "
+    "Adaptive RAG · Fusion RAG · RRF · CRAG · Every answer traceable to the graph"
+)
+st.divider()
+
+# ── Live Metrics Header Row ───────────────────────────────────────────────────
+_last_meta = next(
+    (m.get("meta", {}) for m in reversed(st.session_state.messages)
+     if m.get("role") == "assistant"),
+    {},
+)
+_last_route    = _last_meta.get("route", "")
+_last_crag     = _last_meta.get("crag_status", "")
+_route_display = {
+    "DIRECT_LOOKUP":   "⚡ Direct Lookup",
+    "COMPLEX_REASONING": "🧠 Complex Reasoning",
+}.get(_last_route, "— Awaiting first query")
+_crag_display  = {
+    "RELEVANT":   "🟢 Relevant",
+    "AMBIGUOUS":  "🟡 Ambiguous",
+    "IRRELEVANT": "🔴 Irrelevant",
+}.get(_last_crag, "— Awaiting first query")
+
+hc1, hc2, hc3 = st.columns(3)
+with hc1:
+    if graph:
+        st.metric("🗄️ Knowledge Graph", "🟢 Connected", f"{total_nodes} nodes indexed")
+    else:
+        st.metric("🗄️ Knowledge Graph", "🔴 Offline",
+                  (neo4j_err or "Check .env")[:45])
+with hc2:
+    st.metric("🔀 Adaptive Route", _route_display)
+with hc3:
+    _ragas_label = "🎯 Target: 80%+ Accuracy"
+    _ragas_delta = "Benchmark dataset loaded" if EVAL_DATASET else "Load evaluation_dataset.py"
+    st.metric("📊 RAGas Baseline", _ragas_label, _ragas_delta)
+
+st.divider()
 
 # ── Ingestion Process Log ────────────────────────────────────────────────────
 if st.session_state.ingest_log:
-    st.subheader("📜 Ingestion Process Log")
-    log_html = '<div class="process-log">'
-    for level, msg in st.session_state.ingest_log:
-        cls = {"info": "log-info", "success": "log-success",
-               "warn": "log-warn", "err": "log-err"}.get(level, "log-info")
-        ts = ""
-        log_html += f'<div class="log-line {cls}">{ts}{msg}</div>'
-    log_html += "</div>"
-    st.markdown(log_html, unsafe_allow_html=True)
+    with st.expander("📜 Ingestion Process Log", expanded=True):
+        level_prefix = {"info": "ℹ️", "success": "✅", "warn": "⚠️", "err": "❌"}
+        log_lines = [
+            f"{level_prefix.get(lvl, '•')} {msg}"
+            for lvl, msg in st.session_state.ingest_log
+        ]
+        st.code("\n".join(log_lines), language=None)
 
-    if st.session_state.ingest_stats:
-        s = st.session_state.ingest_stats
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Rules", s["rules"])
-        c2.metric("Conditions", s["conditions"])
-        c3.metric("Outcomes", s["outcomes"])
-        c4.metric("Conflicts", s["conflicts"])
+        if st.session_state.ingest_stats:
+            s = st.session_state.ingest_stats
+            ic1, ic2, ic3, ic4 = st.columns(4)
+            ic1.metric("Rules", s["rules"])
+            ic2.metric("Conditions", s["conditions"])
+            ic3.metric("Outcomes", s["outcomes"])
+            ic4.metric("Conflicts", s["conflicts"])
 
 
 # ── Full Graph View ──────────────────────────────────────────────────────────
@@ -2535,105 +2972,154 @@ st.subheader("💬 Policy Chat")
 
 for msg in st.session_state.messages:
     if msg["role"] == "user":
-        st.markdown(
-            f'<div class="msg-user"><div class="bubble">{msg["content"]}</div>'
-            f'<div class="avatar avatar-user">👤</div></div>',
-            unsafe_allow_html=True,
-        )
+        with st.chat_message("user"):
+            st.markdown(msg["content"])
     else:
-        st.markdown(
-            f'<div class="msg-bot"><div class="avatar avatar-bot">🤖</div>'
-            f'<div class="bubble">{msg["content"]}</div></div>',
-            unsafe_allow_html=True,
-        )
-        meta = msg.get("meta", {})
-        if meta:
-            # ── Trust Dashboard (addition, not a replacement) ──────────
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(msg["content"])
+            meta = msg.get("meta", {})
+            if not meta:
+                continue
+
+            # ── Trust Dashboard ───────────────────────────────────────
             render_trust_dashboard(
                 meta.get("raw", []),
                 meta.get("cypher", "N/A"),
                 meta.get("used_fallback", False),
             )
-            # ── Plain-English Narrator caption ────────────────────────
-            narration = meta.get("narration")
-            if not narration:
-                try:
-                    narration = narrate_path(meta.get("raw", []))
-                except Exception:
-                    narration = "We checked the policy graph for you."
+
+            # ── Adaptive Route badge ──────────────────────────────────
+            _route     = meta.get("route", "COMPLEX_REASONING")
+            _route_rsn = meta.get("route_reason", "")
+            if _route == "DIRECT_LOOKUP":
+                st.info(f"⚡ **Adaptive Route: Direct Lookup** — {_route_rsn}")
+            else:
+                st.markdown(
+                    f'<span style="background:#4c1d95;color:#c4b5fd;'
+                    f'padding:3px 12px;border-radius:14px;font-size:0.82rem;'
+                    f'font-weight:600;">🧠 Adaptive Route: Complex Reasoning</span>'
+                    f' <span style="font-size:0.8rem;color:#9ca3af;">'
+                    f'— {_route_rsn}</span>',
+                    unsafe_allow_html=True,
+                )
+
+            # ── Plain-English Narrator ────────────────────────────────
+            narration = meta.get("narration") or "We checked the policy graph for you."
             st.caption(f"💬 {narration}")
 
-            with st.expander("🔍 Audit trail · Cypher + raw result"):
-                st.markdown("**Generated Cypher:**")
-                st.code(meta.get("cypher", "N/A"), language="cypher")
+            # ── Trust & Audit Trail expander ──────────────────────────
+            with st.expander("🔍 Trust & Audit Trail"):
 
-                # ── Semantic similarity transparency chart ─────────────
-                scores = meta.get("semantic_scores") or []
+                # 1. CRAG Quality Gate (top, most prominent)
+                crag_st = meta.get("crag_status", "RELEVANT")
+                crag_rs = meta.get("crag_reason", "")
+                if crag_st == "RELEVANT":
+                    st.success(f"🟢 **CRAG Quality Gate: Relevant** — {crag_rs}")
+                elif crag_st == "AMBIGUOUS":
+                    st.warning(f"🟡 **CRAG Quality Gate: Ambiguous** — {crag_rs}")
+                else:
+                    st.error(f"🔴 **CRAG Quality Gate: Irrelevant** — {crag_rs}")
+
+                st.divider()
+
+                # 2. Fusion RAG query variants
+                scores    = meta.get("semantic_scores") or []
+                has_rrf   = any("rrf" in s for s in scores)
+                cypher_hdr = meta.get("cypher", "")
+                variant_lines: list = []
+                if has_rrf:
+                    for _line in cypher_hdr.splitlines():
+                        if _line.startswith("-- queries:"):
+                            try:
+                                variant_lines = _ast.literal_eval(
+                                    _line.replace("-- queries:", "").strip()
+                                )
+                            except Exception:
+                                pass
+                            break
+
+                if variant_lines:
+                    with st.expander(
+                        f"🔀 Fusion RAG — {len(variant_lines)} Query Variants",
+                        expanded=False,
+                    ):
+                        for _i, _vq in enumerate(variant_lines, 1):
+                            st.markdown(f"**{_i}.** {_vq}")
+
+                # 3. RRF score bar chart
                 if scores:
-                    st.markdown(
-                        f"**Semantic similarity scores** "
-                        f"_(threshold = {SEMANTIC_THRESHOLD:.2f})_"
-                    )
-                    df = pd.DataFrame([
+                    _x_field  = "rrf:Q" if has_rrf else "cosine:Q"
+                    _x_title  = ("RRF score — node agreement across query variants"
+                                 if has_rrf else "Cosine similarity")
+                    _sort_col = "rrf" if has_rrf else "cosine"
+                    _tip      = (["node", "rrf", "cosine", "kept"]
+                                 if has_rrf else ["node", "cosine", "kept"])
+                    _df = pd.DataFrame([
                         {
-                            "node":  f"{s['label']} · {s['id']}",
-                            "score": s["score"],
-                            "kept":  "✓ above threshold" if s["kept"]
-                                     else "✗ below threshold",
+                            "node":   f"{s['label']} · {s['id']}",
+                            "cosine": round(s["score"], 4),
+                            "rrf":    round(s.get("rrf", 0.0), 5),
+                            "kept":   "✓ kept" if s["kept"] else "✗ filtered",
                         }
                         for s in scores
                     ])
-                    bars = (
-                        alt.Chart(df)
+                    st.markdown(
+                        f"**{'Fusion RAG RRF' if has_rrf else 'Semantic'} "
+                        f"Retrieval Scores** — cosine threshold "
+                        f"`{SEMANTIC_THRESHOLD:.2f}`"
+                    )
+                    _bars = (
+                        alt.Chart(_df)
                         .mark_bar(cornerRadius=3)
                         .encode(
-                            x=alt.X(
-                                "score:Q",
-                                title="Cosine similarity",
-                                scale=alt.Scale(domain=[0.0, 1.0]),
-                            ),
+                            x=alt.X(_x_field, title=_x_title),
                             y=alt.Y(
                                 "node:N",
                                 title=None,
-                                sort=alt.SortField("score", order="descending"),
+                                sort=alt.SortField(_sort_col, order="descending"),
                             ),
                             color=alt.Color(
                                 "kept:N",
-                                title="Threshold cut",
+                                title="Threshold",
                                 scale=alt.Scale(
-                                    domain=[
-                                        "✓ above threshold",
-                                        "✗ below threshold",
-                                    ],
+                                    domain=["✓ kept", "✗ filtered"],
                                     range=["#22d3ee", "#64748b"],
                                 ),
                                 legend=alt.Legend(orient="bottom"),
                             ),
-                            tooltip=["node", "score", "kept"],
+                            tooltip=_tip,
                         )
-                        .properties(height=max(180, 28 * len(df)))
+                        .properties(height=max(180, 26 * len(_df)))
                     )
-                    threshold_rule = (
-                        alt.Chart(pd.DataFrame({"thr": [SEMANTIC_THRESHOLD]}))
-                        .mark_rule(
-                            color="#fde047", strokeWidth=2, strokeDash=[5, 4],
-                        )
-                        .encode(x="thr:Q")
-                    )
-                    st.altair_chart(bars + threshold_rule, use_container_width=True)
-                    n_kept = sum(1 for s in scores if s["kept"])
+                    st.altair_chart(_bars, use_container_width=True)
+                    _n_kept = sum(1 for s in scores if s["kept"])
                     st.caption(
-                        f"Top {len(scores)} candidates · {n_kept} above the "
-                        f"{SEMANTIC_THRESHOLD:.2f} threshold (kept) · "
-                        f"{len(scores) - n_kept} below (filtered out)."
+                        f"{len(scores)} candidates evaluated · "
+                        f"{_n_kept} above threshold (kept) · "
+                        f"{len(scores) - _n_kept} filtered out"
+                        + (" · RRF-ranked across all query variants." if has_rrf else ".")
                     )
 
-                st.markdown("**Graph result:**")
-                raw = meta.get("raw", [])
-                if isinstance(raw, list) and raw:
-                    st.json(raw[:20])
+                st.divider()
+
+                # 4. Generated Cypher
+                st.markdown("**Generated Cypher Query**")
+                st.code(meta.get("cypher", "N/A"), language="cypher")
+
+                # 5. Raw Neo4j nodes (tabular — easier to read than JSON)
+                st.markdown("**Retrieved Policy Nodes from Neo4j**")
+                _raw = meta.get("raw", [])
+                if isinstance(_raw, list) and _raw:
+                    try:
+                        st.dataframe(
+                            pd.DataFrame(_raw[:20]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    except Exception:
+                        st.json(_raw[:10])
                 else:
-                    st.caption(str(raw)[:1000])
+                    st.caption("_(no rows returned)_")
 
 
 # ── 🏆 Benchmark Results ─────────────────────────────────────────────────────
@@ -2765,7 +3251,11 @@ if graph and st.session_state.messages:
             {},
         )
         score_list = last_meta.get("semantic_scores") or []
-        score_map = {s["id"]: s["score"] for s in score_list if s.get("kept")}
+        # Use RRF score for node ranking when Fusion RAG was active; cosine otherwise.
+        score_map = {
+            s["id"]: (s["rrf"] if "rrf" in s else s["score"])
+            for s in score_list if s.get("kept")
+        }
         top_k = int(st.session_state.get("top_k_reasoning", 5))
 
         r_nodes, r_edges = fetch_reasoning_subgraph(
@@ -2774,7 +3264,7 @@ if graph and st.session_state.messages:
         )
         kept_ids = {n.id for n in r_nodes}
         r_edges = [e for e in r_edges
-                   if e.source in kept_ids and e.to in kept_ids]
+                   if e.source in kept_ids and e.target in kept_ids]
 
         if not r_nodes:
             st.info(
@@ -2869,6 +3359,8 @@ if graph and st.session_state.messages:
 # ── Chat Input ───────────────────────────────────────────────────────────────
 question = st.chat_input("Ask a question about BU's research degree policies...")
 if question:
+    question = _clean_user_query(question)   # isolate before anything touches it
+if question:
     if not chain:
         st.warning("The GraphRAG chain is not ready. Check the sidebar status.")
         st.stop()
@@ -2893,6 +3385,10 @@ if question:
             "narration":        narration,
             "policy_ids":       sorted(r.get("policy_ids") or set()),
             "semantic_scores":  r.get("semantic_scores", []),
+            "crag_status":      r.get("crag_status", "RELEVANT"),
+            "crag_reason":      r.get("crag_reason", "Not evaluated"),
+            "route":            r.get("route", "COMPLEX_REASONING"),
+            "route_reason":     r.get("route_reason", "Not evaluated"),
             "timestamp":        datetime.now().strftime("%H:%M:%S"),
         },
     })

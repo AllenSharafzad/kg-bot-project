@@ -46,10 +46,31 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+# Windows SSL: inject OS trust store so corporate/university proxies work
+try:
+    import ssl as _ssl
+    import httpx as _httpx
+    import truststore as _truststore
+    _truststore.inject_into_ssl()
+    _ssl_ctx = _truststore.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    _http_client = _httpx.Client(verify=_ssl_ctx)
+except Exception:
+    _http_client = None
+
+
+def _llm_kwargs() -> dict:
+    return {"http_client": _http_client} if _http_client is not None else {}
+
+
 from dotenv import load_dotenv
 from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
+
+try:
+    from langchain_anthropic import ChatAnthropic
+except ImportError:
+    ChatAnthropic = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  CONFIGURATION
@@ -57,10 +78,11 @@ from langchain_core.prompts import PromptTemplate
 
 load_dotenv()  # reads NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, OPENAI_API_KEY
 
-NEO4J_URI      = os.getenv("NEO4J_URI")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NEO4J_URI         = os.getenv("NEO4J_URI")
+NEO4J_USERNAME    = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD    = os.getenv("NEO4J_PASSWORD")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Validate — fail fast with a clear message rather than a cryptic Neo4j error
 for var, val in [
@@ -73,6 +95,315 @@ for var, val in [
             f"Missing environment variable: {var}\n"
             f"Add it to your .env file or export it before running."
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.5  FUSION RAG — QUERY GENERATION + RECIPROCAL RANK FUSION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_multiple_queries(user_query: str, num_queries: int = 3) -> list[str]:
+    """
+    Use Claude Sonnet to generate `num_queries` alternative phrasings of a
+    university policy question, enabling Fusion RAG retrieval diversity.
+
+    Strategy — each variant targets a different retrieval angle:
+      • Formal/legal phrasing   → catches exact policy wording in the graph
+      • Student-perspective     → catches colloquial condition-node text
+      • Synonym / related concept → catches semantically adjacent nodes
+
+    Returns a list of plain-string questions (no numbering or preamble).
+    Falls back to [user_query] on any failure so the pipeline always proceeds.
+    """
+    if not user_query.strip():
+        return [user_query]
+
+    llm = None
+    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
+        try:
+            llm = ChatAnthropic(
+                model="claude-sonnet-4-6",
+                temperature=0.4,
+                max_tokens=400,
+                api_key=ANTHROPIC_API_KEY,
+                **_llm_kwargs(),
+            )
+        except Exception:
+            pass
+
+    if llm is None and OPENAI_API_KEY:
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0.4,
+            max_tokens=400,
+            api_key=OPENAI_API_KEY,
+        )
+
+    if llm is None:
+        return [user_query]
+
+    prompt = (
+        f"You are helping to retrieve university policy information. "
+        f"Generate exactly {num_queries} alternative phrasings of the question below. "
+        f"Each variant should approach the question differently:\n"
+        f"  1. Use formal policy / regulatory language\n"
+        f"  2. Use plain student-facing language\n"
+        f"  3. Focus on related synonyms or adjacent concepts\n\n"
+        f"Output ONLY the {num_queries} questions — one per line, "
+        f"no numbering, no bullets, no preamble.\n\n"
+        f"Question: {user_query.strip()}"
+    )
+
+    try:
+        resp = llm.invoke(prompt)
+        text = (getattr(resp, "content", "") or str(resp)).strip()
+        variants = []
+        for line in text.splitlines():
+            line = line.strip().lstrip("-•123456789. )").strip().strip('"').strip()
+            if line and line.lower() != user_query.strip().lower():
+                variants.append(line)
+        return variants[:num_queries] if variants else [user_query]
+    except Exception:
+        return [user_query]
+
+
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[str]],
+    k: int = 60,
+) -> list[tuple[str, float]]:
+    """
+    Reciprocal Rank Fusion (RRF) over multiple ranked node-ID lists.
+
+    RRF score for item d:  RRF(d) = Σ  1 / (k + rank(d, list_i))
+
+    where rank is 1-indexed. Items appearing in more lists AND appearing
+    higher in each list accumulate higher scores.
+
+    Args:
+        ranked_lists: Each inner list is a ranking of node IDs (best first).
+        k:            Smoothing constant (default 60, per the original paper).
+
+    Returns:
+        List of (node_id, rrf_score) sorted by descending score.
+    """
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, node_id in enumerate(ranked, start=1):
+            scores[node_id] = scores.get(node_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda x: -x[1])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.6  CORRECTIVE RAG (CRAG) — CONTEXT RELEVANCE VALIDATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_context_relevance(retrieved_rows: list, user_query: str) -> dict:
+    """
+    CRAG validation layer: judges whether the post-RRF policy context is
+    sufficient and relevant to answer the user's question reliably.
+
+    Classification:
+      RELEVANT   — context directly addresses the query with specific policy detail
+      IRRELEVANT — context is about a different topic or too sparse to be useful
+      AMBIGUOUS  — context partially matches but is missing critical details needed
+
+    Uses Claude Sonnet at temperature=0 for deterministic classification.
+    Falls back to RELEVANT on any LLM or parsing failure so the pipeline is
+    never blocked by the validation layer itself (fail-open contract).
+
+    Args:
+        retrieved_rows: list of Neo4j result dicts (from graph.query())
+        user_query:     the original user question
+
+    Returns:
+        {"status": "RELEVANT"|"IRRELEVANT"|"AMBIGUOUS", "reason": str}
+    """
+    if not retrieved_rows:
+        return {
+            "status": "IRRELEVANT",
+            "reason": "No policy context was retrieved.",
+        }
+    if not (user_query or "").strip():
+        return {
+            "status": "RELEVANT",
+            "reason": "Empty query — validation skipped.",
+        }
+
+    # Build a compact context snapshot: top 6 rows, key fields only.
+    # We deliberately avoid sending full raw rows to keep the prompt small.
+    def _snippet(row: dict) -> str:
+        parts = []
+        for key in ("policyTitle", "ruleLabel", "ruleSection",
+                    "ruleDescription", "conditionText", "outcomes"):
+            val = row.get(key)
+            if val:
+                text = (str(val[0]) if isinstance(val, list) and val else str(val))
+                parts.append(f"{key}: {text[:120]}")
+        return " | ".join(parts) if parts else str(row)[:200]
+
+    snapshot = "\n".join(
+        f"[{i + 1}] {_snippet(r)}"
+        for i, r in enumerate(retrieved_rows[:6])
+    )
+
+    llm = None
+    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
+        try:
+            llm = ChatAnthropic(
+                model="claude-sonnet-4-6",
+                temperature=0,
+                max_tokens=80,
+                api_key=ANTHROPIC_API_KEY,
+                **_llm_kwargs(),
+            )
+        except Exception:
+            pass
+
+    if llm is None and OPENAI_API_KEY:
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0,
+            max_tokens=80,
+            api_key=OPENAI_API_KEY,
+        )
+
+    if llm is None:
+        return {
+            "status": "RELEVANT",
+            "reason": "CRAG LLM unavailable — validation skipped.",
+        }
+
+    prompt = (
+        "You are a retrieval quality judge for a university policy knowledge base.\n\n"
+        f"USER QUERY:\n{user_query.strip()}\n\n"
+        f"RETRIEVED POLICY CONTEXT:\n{snapshot}\n\n"
+        "Assess whether the retrieved context contains sufficient and relevant "
+        "policy information to answer the query accurately.\n\n"
+        "Classification rules:\n"
+        "  RELEVANT   — context directly addresses the query with specific policy details\n"
+        "  IRRELEVANT — context is about a different topic or contains no useful information\n"
+        "  AMBIGUOUS  — context partially matches but is missing critical details\n\n"
+        "Reply with EXACTLY this format (two lines, nothing else):\n"
+        "STATUS: <RELEVANT|IRRELEVANT|AMBIGUOUS>\n"
+        "REASON: <one sentence explanation, max 25 words>"
+    )
+
+    try:
+        resp = llm.invoke(prompt)
+        text = (getattr(resp, "content", "") or str(resp)).strip()
+
+        status = "RELEVANT"
+        reason = "Context evaluated."
+        for line in text.splitlines():
+            line = line.strip()
+            if line.upper().startswith("STATUS:"):
+                raw_val = line.split(":", 1)[1].strip().upper()
+                if raw_val in ("RELEVANT", "IRRELEVANT", "AMBIGUOUS"):
+                    status = raw_val
+            elif line.upper().startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+
+        return {"status": status, "reason": reason}
+    except Exception:
+        return {
+            "status": "RELEVANT",
+            "reason": "CRAG validation error — proceeding normally.",
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.7  ADAPTIVE RAG — QUERY COMPLEXITY ROUTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def route_query(user_query: str, graph=None, chain=None) -> dict:
+    """
+    Adaptive RAG entry-point router: classifies incoming query complexity to
+    select the optimal retrieval path before any embedding or graph work begins.
+
+    Routes:
+      DIRECT_LOOKUP      — simple, single-hop, factual questions that map to
+                           one policy section or one rule.  Single vector search
+                           is sufficient; multi-query Fusion RAG would add cost
+                           with no retrieval benefit.
+                           Examples: "What is the draft submission deadline?",
+                                     "How many supervisors can a FT PhD have?"
+
+      COMPLEX_REASONING  — multi-hop, thematic, comparative, or cross-policy
+                           questions that benefit from diverse query angles and
+                           the full RRF + CRAG pipeline.
+                           Examples: "How does the suspension policy interact
+                                      with international visa restrictions?",
+                                     "Compare examiner independence rules
+                                      across all uploaded policies."
+
+    Uses Claude Sonnet at temperature=0, max_tokens=50 for a fast, deterministic
+    two-line classification.  Fail-open contract: any exception returns
+    COMPLEX_REASONING so the full flagship pipeline always runs as the safe
+    default.
+
+    Returns:
+        {"route": "DIRECT_LOOKUP"|"COMPLEX_REASONING", "reason": str}
+    """
+    if not (user_query or "").strip():
+        return {"route": "COMPLEX_REASONING", "reason": "Empty query — defaulting to full pipeline."}
+
+    llm = None
+    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
+        try:
+            llm = ChatAnthropic(
+                model="claude-sonnet-4-6",
+                temperature=0,
+                max_tokens=50,
+                api_key=ANTHROPIC_API_KEY,
+                **_llm_kwargs(),
+            )
+        except Exception:
+            pass
+
+    if llm is None and OPENAI_API_KEY:
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0,
+            max_tokens=50,
+            api_key=OPENAI_API_KEY,
+            **_llm_kwargs(),
+        )
+
+    if llm is None:
+        return {"route": "COMPLEX_REASONING", "reason": "Router LLM unavailable — defaulting to full pipeline."}
+
+    prompt = (
+        "You are a query complexity classifier for a university policy knowledge base.\n\n"
+        f"QUERY: {user_query.strip()}\n\n"
+        "Classify this query into exactly one routing path:\n"
+        "  DIRECT_LOOKUP     — simple, factual, single-section question\n"
+        "  COMPLEX_REASONING — multi-hop, comparative, or cross-policy question\n\n"
+        "Reply with EXACTLY this format (two lines, nothing else):\n"
+        "ROUTE: <DIRECT_LOOKUP|COMPLEX_REASONING>\n"
+        "REASON: <one phrase, max 12 words>"
+    )
+
+    try:
+        resp = llm.invoke(prompt)
+        text = (getattr(resp, "content", "") or str(resp)).strip()
+
+        route  = "COMPLEX_REASONING"
+        reason = "Defaulting to full pipeline."
+        for line in text.splitlines():
+            line = line.strip().lstrip("-•*># ")
+            upper = line.upper()
+            if upper.startswith("ROUTE:"):
+                raw_val = line.split(":", 1)[1].strip().upper()
+                # Accept either exact token or a line that contains one of them
+                if "DIRECT_LOOKUP" in raw_val:
+                    route = "DIRECT_LOOKUP"
+                elif "COMPLEX_REASONING" in raw_val:
+                    route = "COMPLEX_REASONING"
+            elif upper.startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+
+        return {"route": route, "reason": reason}
+    except Exception as _e:
+        return {"route": "COMPLEX_REASONING", "reason": f"Router fallback ({type(_e).__name__}) — full pipeline."}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,11 +453,13 @@ def build_llms():
         model="gpt-4o",
         temperature=0,
         api_key=OPENAI_API_KEY,
+        **_llm_kwargs(),
     )
     qa_llm = ChatOpenAI(
         model="gpt-4o",
         temperature=0.1,
         api_key=OPENAI_API_KEY,
+        **_llm_kwargs(),
     )
     return cypher_llm, qa_llm
 
@@ -507,7 +840,7 @@ SCENARIO_KEYWORDS = {
     ],
 }
 
-def route_query(question: str, graph: Neo4jGraph, chain: GraphCypherQAChain) -> dict:
+def cli_route_query(question: str, graph: Neo4jGraph, chain: GraphCypherQAChain) -> dict:
     """
     Route a question either to a pre-built scenario query (guaranteed graph
     edge coverage) or to the LLM-to-Cypher chain (open-domain queries).
@@ -637,5 +970,5 @@ if __name__ == "__main__":
         user_input = input("Your Question (or type 'exit'): ")
         if user_input.lower() == 'exit':
             break
-        result = route_query(user_input, graph, chain)
+        result = cli_route_query(user_input, graph, chain)
         print_result(result)

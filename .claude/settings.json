@@ -2,7 +2,22 @@
   "permissions": {
     "allow": [
       "Bash(git log *)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(git pull *)",
+      "Bash(git fetch *)",
+      "Bash(python -m py_compile app.py)",
+      "Bash(python -m py_compile graphrag_policy_bot.py)",
+      "Bash(streamlit run *)",
+      "Bash(python3 -c \"import streamlit; print\\(streamlit.__version__\\)\")",
+      "Bash(python -c \"import streamlit; print\\(streamlit.__version__\\)\")",
+      "Bash(streamlit --version)",
+      "Bash(curl -s http://localhost:8501)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501)",
+      "Bash(pip install *)",
+      "Bash(pkill -f \"streamlit run\")",
+      "Read(//tmp/**)",
+      "Bash(python -c ' *)",
+      "Bash(nohup streamlit run app.py --server.headless true --server.port 8501)"
     ]
   }
 }
