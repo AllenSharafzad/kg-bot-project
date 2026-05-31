@@ -67,11 +67,6 @@ from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 
-try:
-    from langchain_anthropic import ChatAnthropic
-except ImportError:
-    ChatAnthropic = None
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,7 +77,6 @@ NEO4J_URI         = os.getenv("NEO4J_URI")
 NEO4J_USERNAME    = os.getenv("NEO4J_USERNAME", "neo4j")
 NEO4J_PASSWORD    = os.getenv("NEO4J_PASSWORD")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Validate — fail fast with a clear message rather than a cryptic Neo4j error
 for var, val in [
@@ -103,7 +97,7 @@ for var, val in [
 
 def generate_multiple_queries(user_query: str, num_queries: int = 3) -> list[str]:
     """
-    Use Claude Sonnet to generate `num_queries` alternative phrasings of a
+    Use GPT-4o to generate `num_queries` alternative phrasings of a
     university policy question, enabling Fusion RAG retrieval diversity.
 
     Strategy — each variant targets a different retrieval angle:
@@ -117,29 +111,16 @@ def generate_multiple_queries(user_query: str, num_queries: int = 3) -> list[str
     if not user_query.strip():
         return [user_query]
 
-    llm = None
-    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
-        try:
-            llm = ChatAnthropic(
-                model="claude-sonnet-4-6",
-                temperature=0.4,
-                max_tokens=400,
-                api_key=ANTHROPIC_API_KEY,
-                **_llm_kwargs(),
-            )
-        except Exception:
-            pass
-
-    if llm is None and OPENAI_API_KEY:
-        llm = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0.4,
-            max_tokens=400,
-            api_key=OPENAI_API_KEY,
-        )
-
-    if llm is None:
+    if not OPENAI_API_KEY:
         return [user_query]
+
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        max_tokens=400,
+        api_key=OPENAI_API_KEY,
+        **_llm_kwargs(),
+    )
 
     prompt = (
         f"You are helping to retrieve university policy information. "
@@ -206,7 +187,7 @@ def evaluate_context_relevance(retrieved_rows: list, user_query: str) -> dict:
       IRRELEVANT — context is about a different topic or too sparse to be useful
       AMBIGUOUS  — context partially matches but is missing critical details needed
 
-    Uses Claude Sonnet at temperature=0 for deterministic classification.
+    Uses GPT-4o at temperature=0 for deterministic classification.
     Falls back to RELEVANT on any LLM or parsing failure so the pipeline is
     never blocked by the validation layer itself (fail-open contract).
 
@@ -245,32 +226,19 @@ def evaluate_context_relevance(retrieved_rows: list, user_query: str) -> dict:
         for i, r in enumerate(retrieved_rows[:6])
     )
 
-    llm = None
-    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
-        try:
-            llm = ChatAnthropic(
-                model="claude-sonnet-4-6",
-                temperature=0,
-                max_tokens=80,
-                api_key=ANTHROPIC_API_KEY,
-                **_llm_kwargs(),
-            )
-        except Exception:
-            pass
-
-    if llm is None and OPENAI_API_KEY:
-        llm = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0,
-            max_tokens=80,
-            api_key=OPENAI_API_KEY,
-        )
-
-    if llm is None:
+    if not OPENAI_API_KEY:
         return {
             "status": "RELEVANT",
             "reason": "CRAG LLM unavailable — validation skipped.",
         }
+
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        max_tokens=80,
+        api_key=OPENAI_API_KEY,
+        **_llm_kwargs(),
+    )
 
     prompt = (
         "You are a retrieval quality judge for a university policy knowledge base.\n\n"
@@ -335,7 +303,7 @@ def route_query(user_query: str, graph=None, chain=None) -> dict:
                                      "Compare examiner independence rules
                                       across all uploaded policies."
 
-    Uses Claude Sonnet at temperature=0, max_tokens=50 for a fast, deterministic
+    Uses GPT-4o at temperature=0, max_tokens=50 for a fast, deterministic
     two-line classification.  Fail-open contract: any exception returns
     COMPLEX_REASONING so the full flagship pipeline always runs as the safe
     default.
@@ -346,30 +314,16 @@ def route_query(user_query: str, graph=None, chain=None) -> dict:
     if not (user_query or "").strip():
         return {"route": "COMPLEX_REASONING", "reason": "Empty query — defaulting to full pipeline."}
 
-    llm = None
-    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
-        try:
-            llm = ChatAnthropic(
-                model="claude-sonnet-4-6",
-                temperature=0,
-                max_tokens=50,
-                api_key=ANTHROPIC_API_KEY,
-                **_llm_kwargs(),
-            )
-        except Exception:
-            pass
-
-    if llm is None and OPENAI_API_KEY:
-        llm = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0,
-            max_tokens=50,
-            api_key=OPENAI_API_KEY,
-            **_llm_kwargs(),
-        )
-
-    if llm is None:
+    if not OPENAI_API_KEY:
         return {"route": "COMPLEX_REASONING", "reason": "Router LLM unavailable — defaulting to full pipeline."}
+
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        max_tokens=50,
+        api_key=OPENAI_API_KEY,
+        **_llm_kwargs(),
+    )
 
     prompt = (
         "You are a query complexity classifier for a university policy knowledge base.\n\n"

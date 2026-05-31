@@ -54,10 +54,6 @@ try:
     from langchain_openai import OpenAIEmbeddings
 except ImportError:
     OpenAIEmbeddings = None
-try:
-    from langchain_anthropic import ChatAnthropic
-except ImportError:
-    ChatAnthropic = None
 from langchain_core.prompts import PromptTemplate
 
 # Fusion RAG + CRAG + Adaptive RAG helpers live in the CLI prototype module.
@@ -131,7 +127,6 @@ NEO4J_URI      = get_cred("NEO4J_URI")
 NEO4J_USERNAME = get_cred("NEO4J_USERNAME") or "neo4j"
 NEO4J_PASSWORD = get_cred("NEO4J_PASSWORD")
 OPENAI_API_KEY    = get_cred("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = get_cred("ANTHROPIC_API_KEY")
 
 # ── Embeddings (semantic search) ─────────────────────────────────────────────
 EMBEDDING_MODEL = "text-embedding-3-small"
@@ -394,13 +389,21 @@ def count_nodes(graph) -> int:
         return 0
 
 
-def fetch_policies(graph) -> list[dict]:
+def get_ingested_policies(graph) -> list[dict]:
     """
-    Return every (:Policy) node with its child counts, newest first.
+    Read the (:Policy) nodes straight from Neo4j (never from st.session_state)
+    with their Rule/Condition/Outcome child counts, newest first.
     Each item: {id, title, version, ingestedAt, rules, conditions, outcomes}.
+
+    Raises on query failure so the caller can surface the real Neo4j error
+    instead of silently rendering an empty list — a previous version swallowed
+    a CypherSyntaxError here, which made populated graphs read as "no policies".
     """
     if graph is None:
         return []
+    # NOTE: the final aggregation is projected through a WITH and the ORDER BY
+    # references the *aliases* (ingestedAt, title), not p.* — newer Neo4j/AuraDB
+    # rejects accessing pre-WITH variables after a DISTINCT/aggregating RETURN.
     q = """
     MATCH (p:Policy)
     OPTIONAL MATCH (r:Rule      {policy_id: p.id})
@@ -408,19 +411,17 @@ def fetch_policies(graph) -> list[dict]:
     OPTIONAL MATCH (c:Condition {policy_id: p.id})
     WITH p, rules, count(DISTINCT c) AS conditions
     OPTIONAL MATCH (o:Outcome   {policy_id: p.id})
-    RETURN p.id          AS id,
-           p.title       AS title,
-           p.version     AS version,
+    WITH p, rules, conditions, count(DISTINCT o) AS outcomes
+    RETURN p.id              AS id,
+           p.title           AS title,
+           p.version         AS version,
            toString(p.ingestedAt) AS ingestedAt,
            rules,
            conditions,
-           count(DISTINCT o) AS outcomes
-    ORDER BY p.ingestedAt DESC, p.title
+           outcomes
+    ORDER BY ingestedAt DESC, title
     """
-    try:
-        return list(graph.query(q))
-    except Exception:
-        return []
+    return list(graph.query(q))
 
 
 def delete_policy(graph, policy_id: str) -> dict:
@@ -769,9 +770,8 @@ def _merge_xml_fragments(raw_fragments: list[str], log_fn) -> str:
 
 def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
     """
-    End-to-end: uploaded PDF → extracted text → LLM structured XML → bytes
-    ready for ingest_xml_to_neo4j. Uses Claude Sonnet when ANTHROPIC_API_KEY
-    is available, else falls back to GPT-4o.
+    End-to-end: uploaded PDF → extracted text → GPT-4o structured XML → bytes
+    ready for ingest_xml_to_neo4j. Uses GPT-4o (temperature=0) exclusively.
     """
     pdf_bytes = pdf_file.read() if hasattr(pdf_file, "read") else pdf_file
     text = _extract_pdf_text(pdf_bytes, log_fn)
@@ -787,33 +787,17 @@ def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
            f"📄 PDF text is {len(text):,} chars — split into {len(chunks)} chunk(s) "
            f"of ~{CHUNK_SIZE:,} chars (overlap {CHUNK_OVERLAP:,}).")
 
-    # Pick the best available LLM
-    llm = None
-    model_name = None
-    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
-        try:
-            llm = ChatAnthropic(
-                model="claude-sonnet-4-6",
-                temperature=0,
-                max_tokens=8000,
-                api_key=ANTHROPIC_API_KEY,
-                **_llm_kwargs(),
-            )
-            model_name = "claude-sonnet-4-6"
-        except Exception as e:
-            log_fn("warn", f"Claude unavailable ({e}); falling back to OpenAI.")
-
-    if llm is None:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("No ANTHROPIC_API_KEY or OPENAI_API_KEY available.")
-        llm = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0,
-            max_tokens=8000,
-            api_key=OPENAI_API_KEY,
-            **_llm_kwargs(),
-        )
-        model_name = "gpt-4o"
+    # GPT-4o structured-extraction LLM (deterministic, OpenAI-only).
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required for PDF → XML extraction.")
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        max_tokens=8000,
+        api_key=OPENAI_API_KEY,
+        **_llm_kwargs(),
+    )
+    model_name = "gpt-4o"
 
     raw_fragments: list[str] = []
     for i, chunk in enumerate(chunks, 1):
@@ -1850,7 +1834,7 @@ def _keywords(question: str, top_k=5):
 @st.cache_data(show_spinner=False, max_entries=512)
 def generate_search_variants(question: str, n: int = 4) -> list[str]:
     """
-    Ask the lightweight LLM (Haiku/GPT-mini) for n alternate phrasings of the
+    Ask the lightweight LLM (GPT-4o-mini) for n alternate phrasings of the
     user's question — synonyms, related concepts, formal/informal rewrites.
     Returns a list of plain strings (no numbering, no preamble).
     Cached so re-runs of the same question don't pay the LLM tax twice.
@@ -2194,18 +2178,7 @@ def _ground_answer_from_rows(question, rows):
 # 7.5  TRUST DASHBOARD & PLAIN-ENGLISH NARRATOR
 # ─────────────────────────────────────────────────────────────────────────────
 def _init_narrator():
-    """Haiku 4.5 if ANTHROPIC_API_KEY is set, else GPT-4o-mini fallback."""
-    if ANTHROPIC_API_KEY and ChatAnthropic is not None:
-        try:
-            return ChatAnthropic(
-                model="claude-haiku-4-5-20251001",
-                temperature=0.2,
-                **_llm_kwargs(),
-                max_tokens=120,
-                api_key=ANTHROPIC_API_KEY,
-            )
-        except Exception:
-            pass
+    """GPT-4o-mini plain-English narrator (OpenAI-only)."""
     if OPENAI_API_KEY:
         return ChatOpenAI(
             model="gpt-4o-mini",
@@ -2699,8 +2672,8 @@ with st.sidebar:
             st.error("Neo4j not connected.")
         elif fitz is None:
             st.error("PyMuPDF is not installed. Run: pip install pymupdf")
-        elif not (ANTHROPIC_API_KEY or OPENAI_API_KEY):
-            st.error("No LLM API key available for PDF transformation.")
+        elif not OPENAI_API_KEY:
+            st.error("OPENAI_API_KEY is required for PDF transformation.")
         else:
             try:
                 st.session_state.ingest_log = []
@@ -2739,10 +2712,21 @@ with st.sidebar:
     # ── Policy Management ───────────────────────────────────────────────────
     st.divider()
     st.markdown("**Policy Management**")
-    policies = fetch_policies(graph) if graph else []
+
+    # Always read live from the graph; surface any Neo4j error rather than
+    # silently rendering "No policies ingested yet" over a populated database.
+    policies = []
+    policies_err = None
+    if graph:
+        try:
+            policies = get_ingested_policies(graph)
+        except Exception as _pe:
+            policies_err = str(_pe)
 
     if not graph:
         st.caption("Neo4j not connected.")
+    elif policies_err:
+        st.error(f"Could not list policies: {policies_err}")
     elif not policies:
         st.caption("No policies ingested yet.")
     else:
@@ -3264,7 +3248,7 @@ if graph and st.session_state.messages:
         )
         kept_ids = {n.id for n in r_nodes}
         r_edges = [e for e in r_edges
-                   if e.source in kept_ids and e.target in kept_ids]
+                   if e.source in kept_ids and e.to in kept_ids]
 
         if not r_nodes:
             st.info(
