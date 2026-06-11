@@ -59,6 +59,21 @@ except Exception:
 
 
 def _llm_kwargs() -> dict:
+    """Return the keyword arguments every ChatOpenAI/embedder constructor needs.
+
+    Returns:
+        dict: ``{"http_client": <httpx.Client>}`` when a truststore-backed HTTP
+        client was successfully built at import time (see the SSL injection block
+        above), otherwise an empty dict ``{}``.
+
+    Logical Rationale:
+        Spreading ``**_llm_kwargs()`` into *every* LLM constructor is what lets
+        the whole module operate behind a corporate/university TLS-intercepting
+        proxy. We pass an *explicit* ``httpx.Client`` (rather than relying solely
+        on the global ``truststore.inject_into_ssl()`` patch) so that no cached
+        OpenAI client can silently bind to a stale SSL context. The empty-dict
+        fallback keeps the call sites identical whether or not a proxy is present.
+    """
     return {"http_client": _http_client} if _http_client is not None else {}
 
 
@@ -94,19 +109,53 @@ for var, val in [
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.5  FUSION RAG — QUERY GENERATION + RECIPROCAL RANK FUSION
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — Fusion RAG layer
+#   This section implements the two primitives that turn a single user question
+#   into a *fused, multi-angle* ranking:
+#       generate_multiple_queries() — query expansion (recall ↑)
+#       reciprocal_rank_fusion()    — rank aggregation (precision ↑)
+#   Both are pure/stateless helpers imported by app.py's `_semantic_search`.
+#
+# EXTENDING THIS SECTION
+#   • To add a 4th retrieval *angle* (e.g. a "legal-citation" rewrite), raise the
+#     `num_queries` default and append a 4th bullet to the prompt in
+#     generate_multiple_queries(); keep T=0 so the variant set stays reproducible
+#     for evaluation runs.
+#   • To add a new *stream* to the fusion (e.g. a BM25 full-text stream), do NOT
+#     change reciprocal_rank_fusion() — it already accepts an arbitrary number of
+#     ranked lists. Just append the new stream's ranked node-ID list to the
+#     `ranked_lists` argument at the call site in app.py._semantic_search.
+#   • To tune fusion aggressiveness, change `k` (see its justification below).
+# ─────────────────────────────────────────────────────────────────────────────
 
 def generate_multiple_queries(user_query: str, num_queries: int = 3) -> list[str]:
-    """
-    Use GPT-4o to generate `num_queries` alternative phrasings of a
-    university policy question, enabling Fusion RAG retrieval diversity.
+    """Generate alternative phrasings of a policy question for Fusion RAG.
 
-    Strategy — each variant targets a different retrieval angle:
-      • Formal/legal phrasing   → catches exact policy wording in the graph
-      • Student-perspective     → catches colloquial condition-node text
-      • Synonym / related concept → catches semantically adjacent nodes
+    Uses GPT-4o (T=0) to rewrite the question from several retrieval angles so
+    that downstream vector search casts a wider net than a single embedding can.
 
-    Returns a list of plain-string questions (no numbering or preamble).
-    Falls back to [user_query] on any failure so the pipeline always proceeds.
+    Args:
+        user_query (str): The cleaned user question. Whitespace-only input is
+            returned unchanged (wrapped in a single-element list).
+        num_queries (int): How many alternative phrasings to request. Default 3;
+            with the original question this yields up to 4 query strings.
+
+    Returns:
+        list[str]: Plain-string questions with numbering/bullets/preamble
+        stripped. Always non-empty — falls back to ``[user_query]`` on a missing
+        API key or any exception, so the pipeline can never stall here.
+
+    Mathematical/Logical Rationale:
+        Query expansion increases *recall* by sampling several points in the
+        embedding space around the user's intent. Each prompt angle targets a
+        different lexical register:
+          1. formal/regulatory  → matches the policy's own statutory wording;
+          2. plain student-facing → matches colloquial Condition-node text;
+          3. synonym/adjacent    → matches semantically neighbouring nodes.
+        Temperature is fixed at 0 deliberately: variant *diversity* is supplied
+        by the three explicit angles, not by sampling noise, which keeps the
+        expanded query set reproducible across evaluation runs (a requirement for
+        comparable RAGAS scores).
     """
     if not user_query.strip():
         return [user_query]
@@ -151,20 +200,38 @@ def reciprocal_rank_fusion(
     ranked_lists: list[list[str]],
     k: int = 60,
 ) -> list[tuple[str, float]]:
-    """
-    Reciprocal Rank Fusion (RRF) over multiple ranked node-ID lists.
-
-    RRF score for item d:  RRF(d) = Σ  1 / (k + rank(d, list_i))
-
-    where rank is 1-indexed. Items appearing in more lists AND appearing
-    higher in each list accumulate higher scores.
+    """Fuse several ranked node-ID lists into one consensus ranking via RRF.
 
     Args:
-        ranked_lists: Each inner list is a ranking of node IDs (best first).
-        k:            Smoothing constant (default 60, per the original paper).
+        ranked_lists (list[list[str]]): Each inner list is a ranking of node IDs,
+            best first. Lists may overlap and need not be the same length. In
+            this system the lists are the per-query vector rankings (Fusion mode)
+            or the vector + keyword streams (Direct-Lookup mode).
+        k (int): Smoothing constant. Default 60 (see rationale below).
 
     Returns:
-        List of (node_id, rrf_score) sorted by descending score.
+        list[tuple[str, float]]: ``(node_id, rrf_score)`` pairs sorted by
+        descending fused score.
+
+    Mathematical/Logical Rationale:
+        Reciprocal Rank Fusion scores each document by
+
+            RRF(d) = Σ_i  1 / (k + rank_i(d))          (rank 1-indexed)
+
+        summed over every list ``i`` in which ``d`` appears. Two properties make
+        this the right choice for heterogeneous streams:
+          • **Scale-invariance.** RRF consumes *ranks*, never raw scores, so a
+            cosine similarity (0–1) and a keyword match-count (0–N) can be fused
+            without normalising two incomparable distributions.
+          • **Consensus reward.** A node ranked highly across multiple lists
+            accumulates contributions from each, so agreement between streams
+            dominates any single stream's idiosyncratic ordering.
+        The constant ``k`` damps the influence of top ranks: as k grows, the gap
+        between rank 1 and rank 2 shrinks, making the fusion more forgiving of a
+        node's absence from one list. ``k = 60`` is the value validated in the
+        original Cormack et al. RRF work and is retained here unchanged — it is
+        empirically robust across sparse/dense heterogeneous corpora, which is
+        exactly the vector-plus-keyword regime this system fuses.
     """
     scores: dict[str, float] = {}
     for ranked in ranked_lists:
@@ -176,27 +243,52 @@ def reciprocal_rank_fusion(
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.6  CORRECTIVE RAG (CRAG) — CONTEXT RELEVANCE VALIDATOR
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — Corrective RAG gate
+#   evaluate_context_relevance() is an *independent judge* of retrieval quality,
+#   sitting between retrieval and answer synthesis. app.py invokes it at two
+#   points (pre-generation on the fallback path; post-hoc on the primary path);
+#   a non-RELEVANT verdict downgrades the answer to an honest refusal rather than
+#   letting the QA LLM synthesise over weak context.
+#
+# EXTENDING THIS SECTION
+#   • To add a new verdict class (e.g. "PARTIAL"), extend the prompt's
+#     classification rules AND the accepted-token set in the parse loop below;
+#     then handle the new status at the call sites in app.py.run_query.
+#   • To make the gate stricter, lower the bar at the call site (treat AMBIGUOUS
+#     as a refusal) rather than editing this judge — keep the judge's vocabulary
+#     stable so audit-trail verdicts remain comparable across versions.
+#   • To swap the judge model, change only the ChatOpenAI(model=...) line; the
+#     strict two-line STATUS/REASON contract is model-agnostic.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_context_relevance(retrieved_rows: list, user_query: str) -> dict:
-    """
-    CRAG validation layer: judges whether the post-RRF policy context is
-    sufficient and relevant to answer the user's question reliably.
-
-    Classification:
-      RELEVANT   — context directly addresses the query with specific policy detail
-      IRRELEVANT — context is about a different topic or too sparse to be useful
-      AMBIGUOUS  — context partially matches but is missing critical details needed
-
-    Uses GPT-4o at temperature=0 for deterministic classification.
-    Falls back to RELEVANT on any LLM or parsing failure so the pipeline is
-    never blocked by the validation layer itself (fail-open contract).
+    """Judge whether retrieved policy context can reliably answer the query (CRAG).
 
     Args:
-        retrieved_rows: list of Neo4j result dicts (from graph.query())
-        user_query:     the original user question
+        retrieved_rows (list): Neo4j result dicts (from ``graph.query()``). Only
+            the top 6 rows and a fixed key subset are sent to the judge to keep
+            the prompt small and the verdict cheap.
+        user_query (str): The original user question.
 
     Returns:
-        {"status": "RELEVANT"|"IRRELEVANT"|"AMBIGUOUS", "reason": str}
+        dict: ``{"status": "RELEVANT"|"IRRELEVANT"|"AMBIGUOUS", "reason": str}``.
+
+    Mathematical/Logical Rationale:
+        This is the "evaluate" step of Corrective RAG: rather than trusting that
+        high retrieval scores imply *answerability*, an LLM judge inspects the
+        actual content and returns a discrete verdict. The design encodes two
+        deliberate asymmetries:
+          • **Short-circuit on emptiness.** No rows ⇒ ``IRRELEVANT`` with no LLM
+            call — a degenerate input needs no model to classify, saving latency
+            and tokens.
+          • **Fail-open contract.** A missing key, empty query, or any exception
+            defaults to ``RELEVANT``. The validation layer is a *guard*, not a
+            *gate that can lock out a legitimate answer*: a flaky judge must never
+            be more harmful than no judge. The cost of a rare false-RELEVANT is
+            bounded by the QA prompt's own grounding rules, whereas a
+            false-IRRELEVANT would silently suppress a correct answer.
+        Temperature is 0 so the same context yields the same verdict, which keeps
+        the ``crag_status`` field in the audit trail reproducible.
     """
     if not retrieved_rows:
         return {
@@ -212,6 +304,11 @@ def evaluate_context_relevance(retrieved_rows: list, user_query: str) -> dict:
     # Build a compact context snapshot: top 6 rows, key fields only.
     # We deliberately avoid sending full raw rows to keep the prompt small.
     def _snippet(row: dict) -> str:
+        """Compress one result row to a short key:value string (≤120 chars/field).
+
+        Keeps the CRAG judge prompt small by sending only the salient fields of
+        the top rows rather than full raw dicts.
+        """
         parts = []
         for key in ("policyTitle", "ruleLabel", "ruleSection",
                     "ruleDescription", "conditionText", "outcomes"):
@@ -281,35 +378,46 @@ def evaluate_context_relevance(retrieved_rows: list, user_query: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.7  ADAPTIVE RAG — QUERY COMPLEXITY ROUTER
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — Adaptive RAG router
+#   route_query() chooses the retrieval *profile* before any embedding or graph
+#   work begins, so the expensive Fusion pipeline only runs when a question
+#   actually needs it. app.py maps the verdict to a single boolean
+#   (`use_fusion = route == "COMPLEX_REASONING"`) threaded through the fallback.
+#
+# EXTENDING THIS SECTION
+#   • To add a third route (e.g. "AGGREGATION" for count/statistics questions),
+#     extend the prompt's option list and the ROUTE token parser below, then
+#     branch on the new route in app.py.run_query.
+#   • The router is intentionally LLM-based, not keyword-based, so it generalises
+#     to unseen phrasings; if cost becomes a concern, a few-shot distilled
+#     classifier can replace the ChatOpenAI call without changing the contract.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def route_query(user_query: str, graph=None, chain=None) -> dict:
-    """
-    Adaptive RAG entry-point router: classifies incoming query complexity to
-    select the optimal retrieval path before any embedding or graph work begins.
+    """Classify query complexity to select the optimal retrieval path (Adaptive RAG).
 
-    Routes:
-      DIRECT_LOOKUP      — simple, single-hop, factual questions that map to
-                           one policy section or one rule.  Single vector search
-                           is sufficient; multi-query Fusion RAG would add cost
-                           with no retrieval benefit.
-                           Examples: "What is the draft submission deadline?",
-                                     "How many supervisors can a FT PhD have?"
-
-      COMPLEX_REASONING  — multi-hop, thematic, comparative, or cross-policy
-                           questions that benefit from diverse query angles and
-                           the full RRF + CRAG pipeline.
-                           Examples: "How does the suspension policy interact
-                                      with international visa restrictions?",
-                                     "Compare examiner independence rules
-                                      across all uploaded policies."
-
-    Uses GPT-4o at temperature=0, max_tokens=50 for a fast, deterministic
-    two-line classification.  Fail-open contract: any exception returns
-    COMPLEX_REASONING so the full flagship pipeline always runs as the safe
-    default.
+    Args:
+        user_query (str): The cleaned user question.
+        graph: Unused here; accepted so the router shares a call signature with
+            other entry points and can later consult the live schema if needed.
+        chain: Unused here; reserved for the same forward-compatibility reason.
 
     Returns:
-        {"route": "DIRECT_LOOKUP"|"COMPLEX_REASONING", "reason": str}
+        dict: ``{"route": "DIRECT_LOOKUP"|"COMPLEX_REASONING", "reason": str}``.
+            DIRECT_LOOKUP — simple, single-hop, single-section factual questions
+            (e.g. "What is the draft submission deadline?"). COMPLEX_REASONING —
+            multi-hop, thematic, comparative, or cross-policy questions.
+
+    Mathematical/Logical Rationale:
+        This realises the Adaptive RAG principle of matching retrieval *cost* to
+        query *complexity*. A direct lookup maps to one section, so multi-query
+        expansion would spend tokens and latency for no recall gain; a complex
+        question benefits from the diverse-angle Fusion + RRF + CRAG path. Uses
+        GPT-4o at T=0, max_tokens=50 for a fast, deterministic two-line verdict.
+        **Fail-open contract:** empty query, missing key, or any exception
+        returns COMPLEX_REASONING, so the most thorough pipeline is always the
+        safe default — misrouting a hard question to the cheap path would harm
+        answer quality, whereas the reverse only costs a little extra compute.
     """
     if not (user_query or "").strip():
         return {"route": "COMPLEX_REASONING", "reason": "Empty query — defaulting to full pipeline."}
@@ -363,16 +471,37 @@ def route_query(user_query: str, graph=None, chain=None) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  NEO4J CONNECTION  (Part 1 of the brief)
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — graph connection & live schema
+#   The schema returned by refresh_schema() is injected verbatim into the Cypher
+#   prompt, so the LLM only ever sees node labels / relationship types / property
+#   keys that actually exist. This is the single most important hallucination
+#   guard in the pipeline: it makes inventing a non-existent edge type unlikely.
+#
+# EXTENDING THIS SECTION
+#   • To point at a different database, change only the .env variables — no code
+#     change is needed.
+#   • `enhanced_schema=True` adds sampled property *values* to the schema text,
+#     which materially improves Cypher quality; turn it off only if the schema
+#     string grows large enough to crowd the prompt's token budget.
+#   • `sanitize=True` strips harmful characters from LLM-generated Cypher; keep
+#     it on whenever `allow_dangerous_requests=True` is used downstream.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_graph() -> Neo4jGraph:
-    """
-    Establish the connection to Neo4j AuraDB and return a Neo4jGraph object.
+    """Connect to Neo4j AuraDB and load the live schema for prompt injection.
 
-    Neo4jGraph does two things automatically:
-      - Keeps the Bolt/Bolt+S connection alive via a connection pool
-      - Calls graph.refresh_schema() to read all node labels, relationship
-        types, and property keys — this schema is injected into the Cypher
-        generation prompt so the LLM knows exactly what exists in the graph.
+    Returns:
+        Neo4jGraph: A connected graph handle whose ``.schema`` has been refreshed.
+
+    Logical Rationale:
+        ``Neo4jGraph`` maintains the Bolt/Bolt+S connection pool and, via
+        ``refresh_schema()``, reads every node label, relationship type, and
+        property key from the live database. That schema string is later fed into
+        ``CYPHER_GENERATION_PROMPT``, so the Cypher LLM is grounded in what the
+        graph *actually* contains rather than what it might assume — the primary
+        defence against generating traversals over edges that do not exist.
+        ``enhanced_schema=True`` enriches that text with sampled property values;
+        ``sanitize=True`` hardens the graph against malicious generated Cypher.
     """
     graph = Neo4jGraph(
         url=NEO4J_URI,
@@ -403,6 +532,20 @@ def build_graph() -> Neo4jGraph:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_llms():
+    """Construct the two purpose-separated GPT-4o instances used by the chain.
+
+    Returns:
+        tuple[ChatOpenAI, ChatOpenAI]: ``(cypher_llm, qa_llm)``.
+
+    Logical Rationale:
+        Generation and synthesis have opposite tolerance for creativity, so they
+        get different temperatures:
+          • ``cypher_llm`` (T=0) — Cypher must be deterministic and syntactically
+            exact; any sampling noise risks an invalid or subtly wrong query.
+          • ``qa_llm`` (T=0.1) — a touch of warmth yields more natural prose while
+            the QA system prompt still pins the answer to the graph context.
+        Both receive ``**_llm_kwargs()`` so they share the truststore HTTP client.
+    """
     cypher_llm = ChatOpenAI(
         model="gpt-4o",
         temperature=0,
@@ -420,6 +563,22 @@ def build_llms():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  PROMPT TEMPLATES
+# ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — Cypher-generation & grounded-answer contracts
+#   CYPHER_GENERATION_TEMPLATE teaches the LLM the full relational vocabulary of
+#   the graph (node types, edge types, mandatory query rules, worked examples).
+#   QA_SYSTEM_PROMPT constrains the answer LLM to the returned rows only.
+#
+# EXTENDING THIS SECTION — adding a NEW EDGE TYPE to the schema
+#   1. Add the edge to the "RELATIONSHIP TYPES" block below with its direction
+#      and any edge properties (mirror the existing [:CONFLICTS] entry).
+#   2. If the edge participates in eligibility/escalation reasoning, add a line
+#      to "MANDATORY QUERY RULES" telling the LLM when to OPTIONAL MATCH it.
+#   3. Add at least one worked EXAMPLE that traverses the new edge — few-shot
+#      examples raise Cypher accuracy far more than prose rules alone.
+#   4. Mirror the ingestion side in app.py.ingest_xml_to_neo4j so the edge is
+#      actually materialised, and update QA_SYSTEM_PROMPT if the answer must
+#      surface the new relationship explicitly (cf. RULE 2/3/4 below).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── 3a. CYPHER GENERATION PROMPT ─────────────────────────────────────────────
@@ -586,13 +745,27 @@ QA_PROMPT = PromptTemplate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_chain(graph: Neo4jGraph, cypher_llm, qa_llm) -> GraphCypherQAChain:
-    """
-    Assemble the GraphCypherQAChain.
+    """Assemble the two-LLM GraphCypherQAChain (generation → execution → synthesis).
 
-    GraphCypherQAChain internally runs two steps:
-      Step A: cypher_llm + CYPHER_GENERATION_PROMPT → Cypher string
-      Step B: execute Cypher on Neo4j → raw graph result (list of dicts)
-      Step C: qa_llm + QA_PROMPT + graph result → grounded natural language answer
+    Args:
+        graph (Neo4jGraph): Connected graph whose live schema feeds the Cypher prompt.
+        cypher_llm: GPT-4o (T=0) instance that turns NL → Cypher.
+        qa_llm: GPT-4o (T=0.1) instance that turns graph rows → grounded answer.
+
+    Returns:
+        GraphCypherQAChain: A chain configured to return intermediate steps so the
+        generated Cypher and raw rows are inspectable for the audit trail.
+
+    Logical Rationale:
+        The chain runs three internal steps:
+          A. cypher_llm + CYPHER_GENERATION_PROMPT → Cypher string
+          B. execute Cypher on Neo4j → raw graph result (list of dicts)
+          C. qa_llm + QA_PROMPT + graph result → grounded natural-language answer
+        ``top_k=20`` caps rows returned per query: large enough to capture a
+        rule plus its conditions/outcomes/conflicts for a policy KG of this size,
+        small enough to keep the synthesis prompt well within budget.
+        ``return_intermediate_steps=True`` is what makes the system *transparent*
+        — the exact Cypher and rows are surfaced rather than hidden.
 
     Key parameters:
       allow_dangerous_requests  — must be True; LangChain requires explicit opt-in
@@ -634,11 +807,22 @@ def build_chain(graph: Neo4jGraph, cypher_llm, qa_llm) -> GraphCypherQAChain:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def scenario_a_sick_leave_override(graph: Neo4jGraph) -> dict:
-    """
-    Scenario A — Borderline Eligibility: Illness + Missed Deadline
-    Traverses: R4.1 --[HAS_CONDITION]--> C4.1.2
-               checks --[OVERRIDES]--> edges for mitigating rules
-               checks --[ESCALATES_TO]--> chains
+    """Run the pre-built Scenario A traversal: illness override of a missed deadline.
+
+    Args:
+        graph (Neo4jGraph): Connected graph handle.
+
+    Returns:
+        dict: ``{"scenario", "description", "graph_result"}`` where
+        ``graph_result`` is the raw Neo4j rows for the QA LLM to ground on.
+
+    Logical Rationale:
+        Eligibility questions hinge on whether a *mitigating* rule suppresses a
+        negative outcome. A free-form LLM-to-Cypher attempt may omit the
+        ``OVERRIDES`` / ``ESCALATES_TO`` traversal and wrongly report withdrawal.
+        Hard-coding the traversal (R4.1 ─HAS_CONDITION→ C4.1.2, then OPTIONAL
+        MATCH the OVERRIDES and ESCALATES_TO edges) *guarantees* the mitigating
+        path is always inspected, regardless of phrasing.
     """
     cypher = """
     MATCH (r:Rule {id: "R4.1"})-[:HAS_CONDITION]->(c:Condition {id: "C4.1.2"})
@@ -679,12 +863,21 @@ def scenario_a_sick_leave_override(graph: Neo4jGraph) -> dict:
 
 
 def scenario_b_conflicts_edge(graph: Neo4jGraph) -> dict:
-    """
-    Scenario B — Conflicting Rules: BU Staff PGR + Examiner Independence
-    Traverses: R5.1 --[HAS_CONDITION]--> C5.1.2 and C5.1.6
-               C5.1.2 --[CONFLICTS {scenario, resolution}]--> C5.1.6
-    The CONFLICTS edge carries the resolution as an edge property —
-    this is what the LLM surfaces to the user.
+    """Run the pre-built Scenario B traversal: BU-staff-PGR examiner-independence conflict.
+
+    Args:
+        graph (Neo4jGraph): Connected graph handle.
+
+    Returns:
+        dict: ``{"scenario", "description", "graph_result"}``; the rows expose
+        ``conflictScenario`` and ``conflictResolution`` from the CONFLICTS edge.
+
+    Logical Rationale:
+        The resolution of a conflicting-requirements case is stored *on the edge*
+        (``CONFLICTS {scenario, resolution}``) between the two competing
+        Conditions, not on either node. The query therefore OPTIONAL MATCHes the
+        edge and returns its properties so the QA LLM can surface the encoded
+        resolution verbatim instead of attempting to reason it out.
     """
     cypher = """
     MATCH (r:Rule {id: "R5.1"})
@@ -721,12 +914,21 @@ def scenario_b_conflicts_edge(graph: Neo4jGraph) -> dict:
 
 
 def scenario_c_escalation_chain(graph: Neo4jGraph) -> dict:
-    """
-    Scenario C — Escalation: Failed Probationary Review + Engagement Lapse
-    Traverses two simultaneous ESCALATES_TO chains:
-      Chain 1: R4.1 outcome(Withdrawal) --[ESCALATES_TO]--> ...
-      Chain 2: R3.1 --[ESCALATES_TO]--> R3.2 --[ESCALATES_TO]--> Withdrawal
-    Returns both chains so the LLM can explain both active processes.
+    """Run the pre-built Scenario C traversal: two simultaneous escalation chains.
+
+    Args:
+        graph (Neo4jGraph): Connected graph handle.
+
+    Returns:
+        dict: ``{"scenario", "description", "graph_result"}`` containing both
+        escalation chains so the LLM can explain every active process.
+
+    Logical Rationale:
+        A single student may be subject to more than one escalation process at
+        once (here: probationary-review failure *and* an engagement lapse). The
+        query deliberately traverses *both* ``ESCALATES_TO`` chains in one shot —
+        Chain 1 from the R4.1 Withdrawal outcome, Chain 2 R3.1→R3.2→outcome — so
+        the answer cannot accidentally report only one of two concurrent risks.
     """
     cypher = """
     // Chain 1: Probationary Review failure escalation
@@ -795,15 +997,24 @@ SCENARIO_KEYWORDS = {
 }
 
 def cli_route_query(question: str, graph: Neo4jGraph, chain: GraphCypherQAChain) -> dict:
-    """
-    Route a question either to a pre-built scenario query (guaranteed graph
-    edge coverage) or to the LLM-to-Cypher chain (open-domain queries).
+    """Route a question to a guaranteed-coverage scenario query or the open LLM chain.
 
-    Returns a dict with keys:
-      - answer         : the grounded natural language answer
-      - cypher_used    : the Cypher that was executed
-      - graph_result   : raw Neo4j result (for audit)
-      - route          : "scenario_A|B|C" or "llm_chain"
+    Args:
+        question (str): The raw user question.
+        graph (Neo4jGraph): Connected graph handle for scenario traversals.
+        chain (GraphCypherQAChain): The LLM-to-Cypher chain for open-domain queries.
+
+    Returns:
+        dict: ``{"answer", "cypher_used", "graph_result", "route"}`` where
+        ``route`` ∈ {"scenario_A", "scenario_B", "scenario_C", "llm_chain"}.
+
+    Logical Rationale:
+        Detection is keyword-based and ordered B → A → C, not alphabetical: the
+        Scenario-B examiner/conflict vocabulary is the most specific, so it is
+        tested first to avoid a generic word (e.g. "missed") capturing a question
+        that actually concerns examiner independence. Any question matching no
+        scenario falls through to the LLM chain. In production this keyword gate
+        would be replaced by an intent classifier (see the section comment).
     """
     q_lower = question.lower()
 
@@ -858,7 +1069,15 @@ def cli_route_query(question: str, graph: Neo4jGraph, chain: GraphCypherQAChain)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_result(result: dict) -> None:
-    """Pretty-print a query result for development / demo purposes."""
+    """Pretty-print a query result (route, Cypher, answer, raw rows) to stdout.
+
+    Args:
+        result (dict): A result dict as returned by ``cli_route_query``.
+
+    Returns:
+        None. Output is written to stdout, word-wrapped to 70 columns for
+        terminal readability; the raw graph result is printed as an audit trail.
+    """
     separator = "═" * 72
     print(f"\n{separator}")
     print(f"  ROUTE    : {result['route']}")
@@ -903,6 +1122,18 @@ DEMO_QUESTIONS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    """Build and wire the CLI bot's components, returning them ready for the REPL.
+
+    Returns:
+        tuple[Neo4jGraph, GraphCypherQAChain]: ``(graph, chain)`` — a connected
+        graph and the assembled two-LLM chain, used by the ``__main__`` loop.
+
+    Logical Rationale:
+        Construction order is fixed by dependency: the graph must exist (and its
+        schema be loaded) before the chain can be assembled, because the chain
+        injects that schema into its Cypher prompt. Returning both objects lets
+        the interactive loop reuse a single warm connection across questions.
+    """
     print("\n" + "═" * 72)
     print("  GraphRAG Policy Bot — BU Code of Practice for Research Degrees")
     print("  Phase 3: Python Integration Layer")

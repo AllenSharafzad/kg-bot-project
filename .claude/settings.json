@@ -17,7 +17,9 @@
       "Bash(pkill -f \"streamlit run\")",
       "Read(//tmp/**)",
       "Bash(python -c ' *)",
-      "Bash(nohup streamlit run app.py --server.headless true --server.port 8501)"
+      "Bash(nohup streamlit run app.py --server.headless true --server.port 8501)",
+      "Bash(python -m py_compile app.py graphrag_policy_bot.py)",
+      "Bash(python -c \"import ast,io; [print\\(f, 'parsed OK,', sum\\(isinstance\\(n,ast.FunctionDef\\) and ast.get_docstring\\(n\\) is not None for n in ast.walk\\(ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\)\\)\\), 'of', sum\\(isinstance\\(n,ast.FunctionDef\\) for n in ast.walk\\(ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\)\\)\\), 'functions have docstrings'\\) for f in ['app.py','graphrag_policy_bot.py']]\")"
     ]
   }
 }

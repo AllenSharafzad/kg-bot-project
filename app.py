@@ -68,10 +68,16 @@ try:
 except Exception:
     _FUSION_RAG_AVAILABLE = False
 
+    # ── Fallback shims ────────────────────────────────────────────────────────
+    # These no-op/degraded stand-ins are defined ONLY when graphrag_policy_bot
+    # could not be imported, so the app still runs (with Fusion/CRAG/Adaptive RAG
+    # disabled) rather than crashing at import. They mirror the real signatures.
     def generate_multiple_queries(q, num_queries=3):  # noqa: F811
+        """Fallback: no expansion — return the single query unchanged."""
         return [q]
 
     def reciprocal_rank_fusion(ranked_lists, k=60):   # noqa: F811
+        """Fallback RRF, identical to the real one: Σ 1/(k + rank) per node id."""
         scores = {}
         for lst in ranked_lists:
             for rank, nid in enumerate(lst, 1):
@@ -79,9 +85,11 @@ except Exception:
         return sorted(scores.items(), key=lambda x: -x[1])
 
     def evaluate_context_relevance(rows, query):      # noqa: F811
+        """Fallback CRAG: fail-open to RELEVANT so the pipeline is never blocked."""
         return {"status": "RELEVANT", "reason": "CRAG module unavailable."}
 
     def _route_query(query):                          # noqa: F811
+        """Fallback router: always COMPLEX_REASONING (the safe, thorough default)."""
         return {"route": "COMPLEX_REASONING", "reason": "Adaptive RAG module unavailable."}
 
 
@@ -112,9 +120,38 @@ COLOR_DEFAULT    = "#94a3b8"    # slate
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  CREDENTIALS
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — credentials & embedder selection
+#   Secrets resolve from the environment first, then Streamlit secrets, so the
+#   same code runs locally (.env) and on Streamlit Cloud (st.secrets) unchanged.
+#   This section also chooses the embedding backend and pins EMBEDDING_DIMS.
+#
+# EXTENDING THIS SECTION — swapping the embedding fallback model
+#   The offline fallback model is named in _init_embedder() below: change the
+#   ``"all-MiniLM-L6-v2"`` string (and, if its width differs from 384, the
+#   ``return candidate, 384`` dimension) to adopt a different local encoder.
+#   Because every vector index is (re)created at the live EMBEDDING_DIMS during
+#   ingest, switching dimension is safe ONLY if you re-ingest afterwards so the
+#   indices are rebuilt at the new width. To add a third backend, append another
+#   (package, class) pair to the probe loop — order = priority.
+# ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
 def get_cred(key: str) -> str:
+    """Resolve a secret from the environment, falling back to Streamlit secrets.
+
+    Args:
+        key (str): The credential name (e.g. ``"OPENAI_API_KEY"``).
+
+    Returns:
+        str: The resolved value, or ``""`` if set in neither source.
+
+    Logical Rationale:
+        Environment variables take precedence so a developer's local ``.env``
+        always wins; ``st.secrets`` is consulted only as a fallback and wrapped
+        in try/except because accessing it raises when no secrets file exists
+        (the common local-dev case). The empty-string default keeps every call
+        site branch-free — callers test truthiness, never catch.
+    """
     val = os.getenv(key, "")
     if not val:
         try:
@@ -131,19 +168,39 @@ OPENAI_API_KEY    = get_cred("OPENAI_API_KEY")
 # ── Embeddings (semantic search) ─────────────────────────────────────────────
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMS  = 1536          # overridden below if HuggingFace fallback is used
-SEMANTIC_THRESHOLD = 0.70       # Neo4j cosine similarity in [0, 1] — only return ≥ 0.70
+# CRITICAL PARAMETER — SEMANTIC_THRESHOLD = 0.70
+#   Minimum Neo4j cosine similarity (range [0, 1]) for a vector hit to be KEPT in
+#   COMPLEX_REASONING / Fusion mode. Empirical justification (per ARCHITECTURE_REVIEW.md
+#   §4c): on the BU 8A corpus, scores below ~0.70 were dominated by topically
+#   adjacent but non-answering clauses, so 0.70 is the precision/recall knee that
+#   trims drift without discarding genuine paraphrase matches. NOTE: this cut is
+#   *intentionally NOT applied* in DIRECT_LOOKUP mode (see _semantic_search §4d),
+#   where a keyword-only hit may legitimately score 0.0 cosine yet be the exact
+#   factual node required — there the strict top-5-by-RRF rule governs instead.
+SEMANTIC_THRESHOLD = 0.70
 
 
 @st.cache_resource(show_spinner=False)
 def _init_embedder():
-    """
-    Priority 1: OpenAI text-embedding-3-small with truststore http client.
-      A live probe call confirms the endpoint is reachable before returning.
-    Priority 2: Local sentence-transformers all-MiniLM-L6-v2 (384 dims, no
-      network required).  Tried via langchain-huggingface, then
-      langchain-community, so whichever package is installed wins.
+    """Select the best available embedding backend and report its dimension.
 
-    Returns (embedder_instance, embedding_dimension).
+    Returns:
+        tuple[object | None, int]: ``(embedder_instance, embedding_dimension)``.
+        ``(None, 1536)`` if no backend could be initialised (semantic search is
+        then disabled but the app still runs on structured Cypher retrieval).
+
+    Logical Rationale:
+        Selection is a priority cascade, each tier gated by a *live* probe call:
+          1. OpenAI ``text-embedding-3-small`` (1536-dim) via the truststore HTTP
+             client — preferred for quality. A ``embed_query("probe")`` call
+             verifies the endpoint is actually reachable *before* the instance is
+             trusted, so a present-but-blocked key fails over rather than erroring
+             at first real use.
+          2. Local ``all-MiniLM-L6-v2`` (384-dim) via langchain-huggingface, then
+             langchain-community — fully offline, for restrictive proxies.
+        The returned dimension is propagated to ``EMBEDDING_DIMS`` so the vector
+        indices are created at whichever width is live (see §5 ingester). The
+        function is ``@st.cache_resource`` so the probe runs once per session.
     """
     if OpenAIEmbeddings is not None and OPENAI_API_KEY:
         try:
@@ -180,9 +237,22 @@ EMBEDDING_DIMS = _result[1]     # 1536 (OpenAI) or 384 (HuggingFace local)
 
 
 def _embed_with_retry(embed_text: str, max_attempts: int = 3) -> list | None:
-    """
-    Call _embedder.embed_query() with exponential backoff (1 s → 2 s → 4 s).
-    Returns the vector on success, or None after all attempts are exhausted.
+    """Embed text with exponential-backoff retry to survive transient API blips.
+
+    Args:
+        embed_text (str): The text to embed. Empty/falsy input returns ``None``.
+        max_attempts (int): Maximum tries before giving up. Default 3.
+
+    Returns:
+        list | None: The embedding vector on success, or ``None`` once every
+        attempt is exhausted (the caller then skips embedding that node).
+
+    Mathematical/Logical Rationale:
+        Delays double each attempt (1 s → 2 s → 4 s). Exponential backoff spaces
+        retries so a brief rate-limit or network hiccup during a bulk ingest is
+        absorbed without hammering the endpoint, while the hard attempt cap
+        guarantees ingestion cannot hang indefinitely on a persistent outage —
+        a missing embedding degrades search for one node, not the whole run.
     """
     if _embedder is None or not embed_text:
         return None
@@ -200,6 +270,22 @@ def _embed_with_retry(embed_text: str, max_attempts: int = 3) -> list | None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  PROMPTS
+# ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — Cypher-generation & grounded-answer contracts (production graph)
+#   CYPHER_GENERATION_TEMPLATE is the LIVE app's schema contract; it lists only
+#   the relationship types the Streamlit ingester actually materialises
+#   (BELONGS_TO, HAS_CONDITION, HAS_OUTCOME, CONFLICTS_WITH, plus OVERRIDES /
+#   ESCALATES_TO which the prompt tolerates if present). QA_SYSTEM_TEMPLATE pins
+#   the answer to the returned rows and mandates the conflict-detection phrasing.
+#
+# EXTENDING THIS SECTION — adding a NEW EDGE TYPE
+#   1. Add the edge under "RELATIONSHIP TYPES" with direction + properties.
+#   2. Add it to MANDATORY RULE 4's OPTIONAL MATCH list so missing edges never
+#      wipe the result set.
+#   3. Add a worked EXAMPLE that traverses it (few-shot > prose for Cypher).
+#   4. Materialise it in ingest_xml_to_neo4j (§5) and, if it must be surfaced to
+#      the reader, add a GROUNDING RULE to QA_SYSTEM_TEMPLATE.
+#   Keep this template in sync with graphrag_policy_bot.CYPHER_GENERATION_TEMPLATE.
 # ─────────────────────────────────────────────────────────────────────────────
 CYPHER_GENERATION_TEMPLATE = """
 You are an expert Neo4j Cypher query generator for the Bournemouth University
@@ -344,8 +430,35 @@ QA_PROMPT = PromptTemplate(
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  RESOURCE INITIALISATION  (cached)
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — cached, self-healing connections
+#   init_neo4j() and init_chain() are @st.cache_resource so the Bolt pool and the
+#   GraphCypherQAChain are built once and reused across reruns. Both return a
+#   (resource, error) tuple instead of raising, so the UI can render status.
+#
+# EXTENDING THIS SECTION
+#   • Self-healing: a failed connection must NOT pin a (None, error) tuple for
+#     the server lifetime. The CALLER clears the cache on failure
+#     (init_neo4j.clear() / init_chain.clear()) and the sidebar exposes a
+#     "🔄 Reconnect" button — preserve that pattern for any new cached resource.
+#   • To change Cypher/QA models or top_k, edit init_chain() only; the prompts
+#     live in §3 and the chain wiring is centralised here.
+# ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def init_neo4j():
+    """Open (and cache) the Neo4j AuraDB connection with its live schema loaded.
+
+    Returns:
+        tuple[Neo4jGraph | None, str | None]: ``(graph, None)`` on success or
+        ``(None, error_message)`` on failure — never raises, so the sidebar can
+        display the fault and offer a reconnect.
+
+    Logical Rationale:
+        Returning an error tuple rather than throwing keeps the cached resource
+        contract uniform and lets a cold-start AuraDB failure surface as a status
+        line. ``enhanced_schema``/``sanitize`` mirror build_graph() in the CLI
+        module. Because the result is cached, the caller must call
+        ``init_neo4j.clear()`` after a failure so the next rerun retries live.
+    """
     if not (NEO4J_URI and NEO4J_PASSWORD):
         return None, "Missing NEO4J_URI or NEO4J_PASSWORD"
     try:
@@ -361,6 +474,25 @@ def init_neo4j():
 
 @st.cache_resource(show_spinner=False)
 def init_chain(_graph):
+    """Assemble (and cache) the two-LLM GraphCypherQAChain over the given graph.
+
+    Args:
+        _graph (Neo4jGraph): The connected graph. The leading underscore tells
+            Streamlit NOT to hash this argument (a Neo4jGraph is unhashable);
+            the chain is therefore cached once for the session.
+
+    Returns:
+        tuple[GraphCypherQAChain | None, str | None]: ``(chain, None)`` on
+        success or ``(None, error_message)`` on failure.
+
+    Logical Rationale:
+        Two GPT-4o instances are wired in: cypher_llm (T=0, exact Cypher) and
+        qa_llm (T=0.1, fluent grounded prose) — the same generation/synthesis
+        split as the CLI module. ``top_k=25`` bounds rows per query; the slightly
+        higher value than the prototype's 20 reflects this graph's denser
+        Condition fan-out. ``return_intermediate_steps=True`` exposes the Cypher
+        and rows that drive the transparency dashboard and Reasoning View.
+    """
     if _graph is None or not OPENAI_API_KEY:
         return None, "Graph or API key unavailable"
     try:
@@ -380,6 +512,16 @@ def init_chain(_graph):
 
 
 def count_nodes(graph) -> int:
+    """Return the total node count in the graph, or 0 if unavailable.
+
+    Args:
+        graph (Neo4jGraph | None): The connected graph, or None.
+
+    Returns:
+        int: ``count(n)`` over all nodes; 0 on a missing graph or any query
+        error (used only for a sidebar metric, so a soft 0 is preferable to a
+        crash).
+    """
     if graph is None:
         return 0
     try:
@@ -470,8 +612,33 @@ def delete_policy(graph, policy_id: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  XML → NEO4J INGESTER  (with live process log + semantic labelling)
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — XML → knowledge graph mapping
+#   ingest_xml_to_neo4j() (below) is the single writer to the graph. It wipes the
+#   graph, MERGEs the Policy root, (re)creates the vector indices at the live
+#   EMBEDDING_DIMS, then MERGEs each Rule/Condition/Outcome — every node scoped by
+#   a `policy_id` namespace and embedded for semantic search.
+#
+# EXTENDING THIS SECTION
+#   • New node label: add an `iter("<Tag>")` loop mirroring the Rule loop, MERGE
+#     it with its `policy_id`, and attach it with the appropriate edge.
+#   • New edge type: add a MERGE after the node loops; if it should be searchable
+#     by the Cypher LLM, also declare it in §3's CYPHER_GENERATION_TEMPLATE.
+#   • New risk vocabulary: extend RISK_KEYWORDS — is_risk_text() and the red
+#     node colouring pick it up automatically.
+#   • Idempotency depends on the compound section-anchored id being the MERGE
+#     key; never MERGE a member node on a generated/ephemeral id.
+# ─────────────────────────────────────────────────────────────────────────────
 def _coerce(value: str):
-    """Try to coerce a string attribute to int/float for better Cypher typing."""
+    """Coerce a numeric-looking string attribute to int/float for Cypher typing.
+
+    Args:
+        value (str): A raw XML attribute value.
+
+    Returns:
+        int | float | str: An ``int`` for whole numbers, ``float`` for decimals,
+        else the original trimmed string. Typed properties let Cypher do numeric
+        comparisons (e.g. ``c.wordLimit > 40000``) instead of string compares.
+    """
     v = value.strip()
     if re.fullmatch(r"-?\d+", v):
         return int(v)
@@ -490,16 +657,44 @@ RISK_KEYWORDS = (
 )
 
 def is_risk_text(*parts) -> bool:
+    """Flag whether any text fragment contains risk/sanction vocabulary.
+
+    Args:
+        *parts: Arbitrary text fragments (label, description, text, …); falsy
+            fragments are ignored.
+
+    Returns:
+        bool: True if any ``RISK_KEYWORDS`` token appears in the concatenated,
+        lower-cased text. The result is stored as ``is_risk`` on the node and
+        drives its red colouring in the Reasoning View.
+
+    Logical Rationale:
+        A cheap substring scan (not an LLM call) keeps risk-flagging deterministic
+        and free at ingest scale; matching on stems like "penalis"/"penaliz"
+        catches British/American spellings and inflections without a stemmer.
+    """
     blob = " ".join(p for p in parts if p).lower()
     return any(kw in blob for kw in RISK_KEYWORDS)
 
 
 @st.cache_data(show_spinner=False, max_entries=2048)
 def generate_human_label(text: str) -> str:
-    """
-    Use the LLM to produce a concise 2-3 word human-readable title for
-    a policy node's text. Cached so the same text isn't re-sent to OpenAI.
-    Falls back to a truncated version of the text if the API is unavailable.
+    """Produce a concise 2-3 word human-readable title for a node's text (cached).
+
+    Args:
+        text (str): The node's source text (description / condition / outcome).
+
+    Returns:
+        str: A 2-4 word title (hard-capped). ``"Untitled"`` for empty input; a
+        40-char truncation if ``OPENAI_API_KEY`` is absent or the call fails.
+
+    Logical Rationale:
+        Precise IDs like ``C_13_1_LawThesisWordLimit`` are provenance-bearing but
+        unreadable on a graph node, so a friendly ``label_human`` is generated
+        with gpt-4o-mini (T=0, max_tokens=20) — the cheapest deterministic model
+        adequate for a 2-3 word title. ``@st.cache_data(max_entries=2048)`` means
+        identical text is never re-billed, and the 4-word hard cap protects the
+        visualisation layout from a verbose model response.
     """
     text = (text or "").strip()
     if not text:
@@ -530,6 +725,23 @@ def generate_human_label(text: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.5  PDF → XML AUTOMATED PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — PDF → strict XML extraction
+#   The most failure-prone layer: an unstructured PDF becomes schema-conformant
+#   XML the ingester can map deterministically. Pipeline:
+#     _extract_pdf_text → _chunk_text → per-chunk gpt-4o (PDF_TO_XML_SYSTEM)
+#     → _merge_xml_fragments → _wrap_xml_fragment → ET.fromstring (final gate).
+#   Defence-in-depth against placeholder nodes lives at THREE layers: the prompt
+#   contract (PDF_TO_XML_SYSTEM), merge-time rejection (_is_generic), and the
+#   section-anchored id grammar that makes collisions impossible.
+#
+# EXTENDING THIS SECTION
+#   • New element type in the XML: add it to PDF_TO_XML_SYSTEM's OUTPUT SCHEMA,
+#     collect it in _merge_xml_fragments, and map it in ingest_xml_to_neo4j.
+#   • Swap the extraction model: change the ChatOpenAI(model=...) line in
+#     process_pdf_to_xml; the strict-XML contract is model-agnostic.
+#   • Tune chunking via CHUNK_SIZE / CHUNK_OVERLAP in process_pdf_to_xml
+#     (justified inline there).
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     import fitz  # PyMuPDF
@@ -607,7 +819,20 @@ OUTPUT RULES
 
 
 def _extract_pdf_text(pdf_bytes: bytes, log_fn) -> str:
-    """Extract text from an uploaded PDF using PyMuPDF. Returns a single string."""
+    """Extract all text from an uploaded PDF using PyMuPDF (fitz).
+
+    Args:
+        pdf_bytes (bytes): Raw bytes of the uploaded PDF.
+        log_fn (callable): ``log_fn(level, message)`` progress sink.
+
+    Returns:
+        str: All page text joined by blank lines, stripped. May be empty for an
+        image-only scan with no OCR layer — the CALLER (process_pdf_to_xml)
+        treats an empty result as a fatal RuntimeError.
+
+    Raises:
+        RuntimeError: If PyMuPDF is not installed.
+    """
     if fitz is None:
         raise RuntimeError("PyMuPDF is not installed. Run: pip install pymupdf")
 
@@ -623,10 +848,23 @@ def _extract_pdf_text(pdf_bytes: bytes, log_fn) -> str:
 
 
 def _wrap_xml_fragment(xml_fragment: str) -> bytes:
-    """
-    The LLM returns sibling <Rule> elements with no single root, and sometimes
-    wraps output in ```xml fences. Strip fences and wrap in <Policy> so
-    ET.fromstring accepts it.
+    """Sanitise an LLM XML fragment and wrap it in a single <Policy> root.
+
+    Args:
+        xml_fragment (str): Raw model output — possibly fenced, prologued, or
+            containing unescaped ``&`` and stray control characters.
+
+    Returns:
+        bytes: A UTF-8 ``<Policy>…</Policy>`` document ready for ``ET.fromstring``.
+
+    Logical Rationale:
+        The model emits sibling ``<Rule>`` elements with no single root and
+        occasionally wraps them in ```` ```xml ```` fences or an ``<?xml?>``
+        prolog. Well-formed XML requires exactly one root, so we strip those
+        artefacts, escape bare ``&`` that are not already valid entities, and
+        delete non-XML control chars (which would otherwise make the parser
+        reject the whole document). The wrap is the last transform before the
+        ``ET.fromstring`` validation gate in process_pdf_to_xml.
     """
     s = xml_fragment.strip()
     if s.startswith("```"):
@@ -647,7 +885,26 @@ def _wrap_xml_fragment(xml_fragment: str) -> bytes:
 
 
 def _chunk_text(text: str, chunk_size: int = 80_000, overlap: int = 2_000) -> list[str]:
-    """Split text into overlapping fixed-size chunks for LLM processing."""
+    """Split text into overlapping fixed-size character windows for LLM processing.
+
+    Args:
+        text (str): The full extracted document text.
+        chunk_size (int): Window size in characters. The signature default
+            (80_000) is generous; process_pdf_to_xml deliberately overrides it
+            to the smaller, empirically-tuned 15_000 (see its body).
+        overlap (int): Characters shared between consecutive windows.
+
+    Returns:
+        list[str]: One element (the whole text) if it fits in a single window,
+        otherwise the ordered overlapping windows.
+
+    Mathematical/Logical Rationale:
+        Consecutive windows advance by ``chunk_size - overlap`` characters, so
+        the trailing ``overlap`` chars of window *n* reappear at the head of
+        window *n+1*. That overlap guarantees a section header straddling a
+        boundary still appears intact in at least one chunk, which is what keeps
+        the section-anchored id extraction reliable across boundaries.
+    """
     if len(text) <= chunk_size:
         return [text]
     chunks: list[str] = []
@@ -662,19 +919,31 @@ def _chunk_text(text: str, chunk_size: int = 80_000, overlap: int = 2_000) -> li
 
 
 def _merge_xml_fragments(raw_fragments: list[str], log_fn) -> str:
-    """
-    Merge chunk XML fragments into a single deduplicated body.
+    """Merge per-chunk XML fragments into one deduplicated <Rule> body.
 
-    Strategy:
-    • Only top-level <Rule> elements are collected (direct children of the
-      fragment root).  Nested sub-Rules are carried along inside their parent
-      and are NOT double-counted.
-    • Deduplication key: tag + "::" + id  (compound section-aware IDs from the
-      new prompt make collisions between genuinely different elements impossible).
-    • If the SAME Rule id appears in two overlapping chunks, the later chunk's
-      unique <Condition> / <Outcome> children are merged into the first copy
-      rather than discarded.
-    • Elements with generic/Untitled ids or labels are rejected before merging.
+    Args:
+        raw_fragments (list[str]): One raw XML string per processed chunk.
+        log_fn (callable): ``log_fn(level, message)`` progress/skip-tally sink.
+
+    Returns:
+        str: A single merged XML body (sibling ``<Rule>`` elements) ready for
+        ``_wrap_xml_fragment``.
+
+    Mathematical/Logical Rationale:
+        Because windows overlap (see _chunk_text), the SAME Rule can legitimately
+        appear in two adjacent fragments. Naive concatenation would duplicate
+        nodes; dropping the later copy would lose conditions that only appeared
+        in the second window. The merger resolves both:
+          • Dedup key = ``tag + "::" + id``. Compound section-anchored ids make a
+            collision between genuinely different elements effectively impossible,
+            so an id match is a true duplicate.
+          • On a repeat id, only the NEW unique ``<Condition>``/``<Outcome>``
+            children are appended to the first registered copy (set-union of
+            children, not replacement).
+          • ``_is_generic`` rejects any element whose id/label is in _FORBIDDEN or
+            matches the bare-id regex ``^[rco]\\d{1,3}$`` — a second line of
+            defence so a placeholder that slipped past the prompt never reaches
+            Neo4j. Rejections are counted and surfaced in the UI log.
     """
     import copy
 
@@ -682,10 +951,20 @@ def _merge_xml_fragments(raw_fragments: list[str], log_fn) -> str:
     _BARE_ID   = re.compile(r"^[rco]\d{1,3}$", re.IGNORECASE)  # R1, C2, O12 …
 
     def _is_generic(val: str) -> bool:
+        """True if an id/label is a forbidden placeholder or a bare ID (R1/C2/O12).
+
+        The merge-time guard that rejects elements the prompt should never have
+        emitted — second line of defence behind the PDF_TO_XML_SYSTEM contract.
+        """
         v = (val or "").strip().lower()
         return v in _FORBIDDEN or bool(_BARE_ID.match(v))
 
     def _sanitise(s: str) -> str:
+        """Strip code fences / XML prolog, escape bare ``&``, drop control chars.
+
+        Prepares a single raw fragment so ElementTree can parse it; mirrors the
+        cleaning in _wrap_xml_fragment but applied per-fragment before merging.
+        """
         if s.startswith("```"):
             s = s.strip("`")
             if s.lower().startswith("xml"):
@@ -779,7 +1058,15 @@ def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
     if not text:
         raise RuntimeError("No extractable text found in the PDF.")
 
-    # Split into overlapping chunks — smaller chunks keep gpt-4o output valid.
+    # CRITICAL PARAMETERS — CHUNK_SIZE = 15_000, CHUNK_OVERLAP = 1_500
+    #   Empirical justification (per ARCHITECTURE_REVIEW.md §2a): GPT-4o emits
+    #   *valid, complete* XML far more reliably on bounded inputs than on a whole
+    #   document, so the 15k window is deliberately small — well below the model's
+    #   context limit — to keep each extraction self-contained and parseable. The
+    #   1.5k (=10%) overlap guarantees a section header split across a boundary
+    #   still appears intact in at least one chunk, preserving the section-anchored
+    #   id grammar. Raising CHUNK_SIZE risks truncated/invalid XML; lowering it
+    #   raises cost and the chance of severing a clause from its section number.
     CHUNK_SIZE = 15_000
     CHUNK_OVERLAP = 1_500
     chunks = _chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
@@ -858,7 +1145,20 @@ def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
 
 
 def _slugify(s: str) -> str:
-    """Turn a free-text title into a safe, stable policy_id."""
+    """Turn a free-text title/version into a safe, stable id fragment.
+
+    Args:
+        s (str): Arbitrary free text (e.g. a policy title or version).
+
+    Returns:
+        str: Lower-cased, hyphen-collapsed slug; ``"policy"`` for empty input.
+
+    Logical Rationale:
+        Used to build the ``policy_id`` namespace key
+        (``f"{_slugify(title)}-{_slugify(version)}"``). Determinism is the whole
+        point: the same title/version must always yield the same slug so re-ingest
+        MERGEs onto the existing Policy node rather than spawning a duplicate.
+    """
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s or "policy"
@@ -901,6 +1201,12 @@ def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
              "policy_id": pid, "policy_title": title}
 
     def run(cypher, params):
+        """Execute one ingest Cypher write, logging + counting failures softly.
+
+        Returns True on success, False on error (incrementing stats['errors']).
+        A single failed MERGE must not abort the whole ingest, so errors are
+        tallied and surfaced rather than raised.
+        """
         try:
             graph.query(cypher, params)
             return True
@@ -1145,6 +1451,22 @@ def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  GRAPH VISUALISATION HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — streamlit-agraph rendering layer
+#   These helpers convert Neo4j rows into vis.js Node/Edge objects with
+#   type-aware colour, size, hierarchy level, hover tooltip, and (in the
+#   Reasoning View) a cyan "the AI looked here" halo plus score-driven opacity.
+#   fetch_full_graph() renders the whole corpus; fetch_reasoning_subgraph()
+#   renders only the nodes a specific answer grounded on.
+#
+# EXTENDING THIS SECTION
+#   • New node label: add it to LABEL_COLORS (colour), LABEL_LEVEL (tree depth),
+#     and LABEL_SIZE (radius). _add_node() reads all three by primary label, so
+#     no further wiring is needed for display.
+#   • New edge styling: edges are built in the fetch_* functions; mirror the
+#     existing kept/dim treatment there.
+#   • IMPORTANT API note: streamlit-agraph's Edge exposes its destination as
+#     ``.to`` (NOT ``.target``) — use ``.source`` / ``.to`` when filtering edges.
+# ─────────────────────────────────────────────────────────────────────────────
 COLOR_POLICY = "#a855f7"     # violet — top-level document anchor
 
 LABEL_COLORS = {
@@ -1183,7 +1505,18 @@ COLOR_SEARCH_DIM = "rgba(100,116,139,0.30)"  # faded slate — non-matches
 
 
 def _color_for(node_labels, props, in_conflict=False):
-    """Pick a node colour. Risk keywords + CONFLICTS edges override the label colour."""
+    """Choose a node's fill colour from its label, with risk/conflict override.
+
+    Args:
+        node_labels (list[str]): The node's Neo4j labels.
+        props (dict): The node's properties (scanned for risk vocabulary).
+        in_conflict (bool): True if the node sits on a CONFLICTS_WITH edge.
+
+    Returns:
+        str: A hex colour. Risk/conflict nodes always return ``COLOR_CONFLICT``
+        (red) regardless of label, so danger is never visually masked by the
+        ordinary label palette; otherwise the per-label colour, or a slate default.
+    """
     if in_conflict or props.get("is_risk") or is_risk_text(
         props.get("text"), props.get("description"),
         props.get("label"), props.get("label_human"), props.get("type"),
@@ -1196,7 +1529,16 @@ def _color_for(node_labels, props, in_conflict=False):
 
 
 def _truncate(s: str, n: int = 28) -> str:
-    """Trim a string to `n` characters with an ellipsis suffix."""
+    """Trim a string to ``n`` characters with a trailing ellipsis.
+
+    Args:
+        s (str): Input text (None tolerated).
+        n (int): Maximum length before truncation. Default 28.
+
+    Returns:
+        str: ``s`` unchanged if short enough, else its first ``n-1`` chars
+        (trailing punctuation stripped) plus "…". Keeps node captions readable.
+    """
     s = (s or "").strip()
     if len(s) <= n:
         return s
@@ -1204,7 +1546,16 @@ def _truncate(s: str, n: int = 28) -> str:
 
 
 def _primary_label(node_labels) -> str:
-    """Return the first non-policy-isolation label for display."""
+    """Return the node's primary display label (first known palette label).
+
+    Args:
+        node_labels (list[str]): The node's Neo4j labels.
+
+    Returns:
+        str: The first label present in ``LABEL_COLORS`` (Policy/Rule/Condition/
+        Outcome/Actor), else the first label, else "". This is what selects the
+        node's colour, size, and hierarchy level downstream.
+    """
     for lbl in (node_labels or []):
         if lbl in LABEL_COLORS:
             return lbl
@@ -1303,14 +1654,29 @@ def _section_chapter(props) -> int | None:
 def _add_node(nodes, seen, nid, n_labels, props,
               size=None, level=None, in_conflict=False, cited=False,
               score=None):
-    """
-    Append a vis.js node with type-aware colour, size, level, tooltip and
-    score-based opacity.
+    """Append a styled vis.js Node to ``nodes`` (idempotent via the ``seen`` set).
 
-    When `cited=True` the node gets a neon-cyan halo + glow making it the
-    unmistakable visual anchor of the Reasoning View. The `score` (cosine
-    similarity in [0,1] from semantic search) drives node opacity so the
-    eye is guided to the most-relevant answers.
+    Args:
+        nodes (list): Accumulator the new Node is appended to.
+        seen (set): IDs already added; a repeat ``nid`` is silently skipped.
+        nid (str): The node id (also its vis.js id).
+        n_labels (list[str]): Neo4j labels — drive colour/size/level defaults.
+        props (dict): Node properties — drive caption, tooltip, risk colour.
+        size (int | None): Explicit radius; falls back to ``LABEL_SIZE``.
+        level (int | None): Explicit tree depth; falls back to ``LABEL_LEVEL``.
+        in_conflict (bool): Force the conflict (red) colour.
+        cited (bool): If True, add the cyan halo/glow marking an answer anchor.
+        score (float | None): Cosine similarity → opacity (see _opacity_for_score).
+
+    Returns:
+        None. Mutates ``nodes`` and ``seen`` in place.
+
+    Logical Rationale:
+        Deduplication by ``seen`` is essential because a 1-hop subgraph query
+        returns the same node once per incident edge; without the guard, vis.js
+        would receive duplicate ids and mis-render. ``cited`` + ``score`` encode
+        the system's transparency goal visually — the eye is drawn to the
+        highest-relevance nodes the AI actually grounded on.
     """
     if not nid or nid in seen:
         return
@@ -1361,7 +1727,15 @@ def _add_node(nodes, seen, nid, n_labels, props,
 
 
 def _node_haystack(n) -> str:
-    """Build a lowercase searchable blob from a Node's visible/internal text."""
+    """Build a lower-cased searchable blob from a vis.js Node's text fields.
+
+    Args:
+        n (Node): A streamlit-agraph Node.
+
+    Returns:
+        str: ``id + label + title`` concatenated and lower-cased, for
+        case-insensitive substring matching in ``decorate_with_search``.
+    """
     parts = [
         getattr(n, "id", ""),
         getattr(n, "label", ""),
@@ -1371,10 +1745,20 @@ def _node_haystack(n) -> str:
 
 
 def decorate_with_search(nodes, query: str):
-    """
-    Real-time search highlighting: matches glow amber, non-matches dim out.
-    Mutates each Node's color/borderWidth/shadow in place.
-    Returns the (count_matches, count_total) tuple for caption rendering.
+    """Highlight nodes matching a live search query; dim the rest (in place).
+
+    Args:
+        nodes (list[Node]): The rendered nodes (mutated in place).
+        query (str): The user's search text; blank disables highlighting.
+
+    Returns:
+        tuple[int, int]: ``(matches, total)`` for the caption. An empty query
+        returns ``(0, total)`` and leaves styling untouched.
+
+    Logical Rationale:
+        Matching keeps each hit's original *semantic* colour and adds an amber
+        halo, so the user still sees what TYPE of node matched while non-matches
+        fade to slate — focus-plus-context rather than hide-the-rest.
     """
     q = (query or "").strip().lower()
     if not q:
@@ -1407,10 +1791,21 @@ def decorate_with_search(nodes, query: str):
 
 
 def fetch_full_graph(graph, limit=500):
-    """
-    Return (nodes, edges) for streamlit-agraph.
-    Uses real labels(n) and properties(n) from Neo4j — no ID prefix guessing,
-    so this works with ANY XML structure.
+    """Build (nodes, edges) for the whole graph, for the full-corpus view.
+
+    Args:
+        graph (Neo4jGraph | None): The connected graph.
+        limit (int): Max rows (node+edge tuples) to pull. Default 500.
+
+    Returns:
+        tuple[list[Node], list[Edge]]: vis.js objects; ``([], [])`` on no graph
+        or query error.
+
+    Logical Rationale:
+        Reads real ``labels(n)``/``properties(n)`` rather than guessing types
+        from id prefixes, so the renderer is agnostic to the ingested XML's
+        shape. CONFLICTS edges are coloured red to surface contradictions at a
+        glance.
     """
     if graph is None:
         return [], []
@@ -1454,19 +1849,28 @@ def fetch_full_graph(graph, limit=500):
 
 def fetch_reasoning_subgraph(graph, node_ids, policy_ids=None,
                               top_k: int = 5, score_map=None):
-    """
-    1-hop subgraph around the node IDs the LLM reasoned over.
+    """Build the 1-hop "the AI looked here" subgraph around the cited node IDs.
 
-    Top-K trimming: cited node IDs are ranked by their semantic similarity
-    score (when available) and capped to `top_k` centres. Their 1-hop
-    neighbours come along for context. This keeps the Reasoning View
-    legible when the answer cites many nodes.
+    Args:
+        graph (Neo4jGraph | None): The connected graph.
+        node_ids (Iterable[str]): IDs the answer actually cited.
+        policy_ids (Iterable[str] | None): If given, restrict centres and
+            neighbours to these policies (plus cross-policy conflict edges).
+        top_k (int): Max centre nodes to keep after ranking. Default 5.
+        score_map (dict | None): ``id → cosine`` used to rank and to set opacity.
 
-    When `policy_ids` is non-empty, center nodes are restricted to those
-    policies, and 1-hop neighbours are kept only if they ALSO belong to one
-    of those policies OR if the edge is a cross-policy CONFLICTS_WITH
-    (cf.cross_policy = true). The :Policy root node IS included so the
-    hierarchical layout has a top.
+    Returns:
+        tuple[list[Node], list[Edge]]: The trimmed reasoning subgraph; cited
+        centres are enlarged and haloed, neighbours are dimmed context, and
+        on-path edges are drawn as a neon-cyan dashed "flow".
+
+    Mathematical/Logical Rationale:
+        Centres are ranked by ``-score`` (missing scores default to a neutral
+        0.5) with the id as a deterministic tie-breaker, then capped at
+        ``top_k``. This bounds visual complexity so the view stays legible even
+        when an answer cites many nodes, while the highest-relevance nodes are
+        guaranteed to survive the trim. The :Policy root is always admitted so
+        the hierarchical layout has a single top.
     """
     if not node_ids or graph is None:
         return [], []
@@ -1582,7 +1986,17 @@ _LINK_STYLE = {
 
 
 def _organic_config(width=1100, height=700) -> Config:
-    """Force-directed layout — best for small/medium subgraphs."""
+    """Build the force-directed (Barnes-Hut) vis.js Config.
+
+    Args:
+        width (int): Canvas width in px.
+        height (int): Canvas height in px.
+
+    Returns:
+        Config: Physics-enabled layout best for small/medium subgraphs where an
+        organic spread reveals clusters; the hierarchical config is preferred for
+        showing the strict Policy→Rule→Condition tree.
+    """
     return Config(
         width=width, height=height,
         directed=True, physics=True, hierarchical=False, improvedLayout=True,
@@ -1635,7 +2049,17 @@ def _hierarchical_config(width=1100, height=700) -> Config:
 
 
 def make_graph_config(layout_mode: str = "organic", height: int = 700) -> Config:
-    """Single entry point used by every graph view."""
+    """Return the vis.js Config for the requested layout mode.
+
+    Args:
+        layout_mode (str): "organic" (force-directed) or any string starting
+            "hier" for the top-down hierarchical tree.
+        height (int): Canvas height in px.
+
+    Returns:
+        Config: A configured streamlit-agraph Config. Organic suits exploratory
+        subgraphs; hierarchical suits showing the Policy→Rule→Condition tree.
+    """
     if (layout_mode or "").lower().startswith("hier"):
         return _hierarchical_config(height=height)
     return _organic_config(height=height)
@@ -1646,6 +2070,15 @@ AGRAPH_CONFIG = _organic_config()
 
 
 def render_legend(highlight_path: bool = False):
+    """Render the colour-key legend pills above a graph view (via st.markdown).
+
+    Args:
+        highlight_path (bool): If True, append the "AI reasoning path" pill —
+            shown only in the Reasoning View where the cyan path is meaningful.
+
+    Returns:
+        None. Writes HTML pills directly to the Streamlit page.
+    """
     items = [
         (COLOR_POLICY,    "Policy"),
         (COLOR_RULE,      "Rule"),
@@ -1677,6 +2110,21 @@ def render_legend(highlight_path: bool = False):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  QUERY EXECUTOR
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — the query orchestrator (Modular RAG)
+#   run_query() (below) is the spine of the read path: clean → route (Adaptive
+#   RAG) → structured Cypher first → conditional Fusion/keyword fallback → CRAG
+#   gate → grounded answer → cite-only Reasoning subgraph. The retrieval engine
+#   (_semantic_search) and the imported Fusion/CRAG helpers do the heavy lifting;
+#   this section also holds the citation-extraction regexes that decide which
+#   nodes the answer actually grounded on.
+#
+# EXTENDING THIS SECTION
+#   • New route: branch on it in run_query and set the right `use_fusion` value.
+#   • New retrieval stream: add it inside _semantic_search and append its ranked
+#     list to the RRF call — run_query needs no change.
+#   • Changing how citations map to the Reasoning View: edit the _ID_PATTERN /
+#     _SECTION_PATTERN regexes and resolve_section_refs_to_ids together.
+# ─────────────────────────────────────────────────────────────────────────────
 # Matches node IDs like R4.1, C5.1.2, C5.1.6, O4.1.A, A1 — works whether they
 # appear bare, inside parentheses "(R4.1)", comma-separated, or glued to
 # punctuation in the LLM's answer.
@@ -1691,17 +2139,36 @@ _SECTION_PATTERN = re.compile(
 
 
 def extract_ids_from_text(text: str):
-    """Pull every policy-style ID mentioned anywhere in a block of text."""
+    """Pull every policy-style node ID mentioned anywhere in a block of text.
+
+    Args:
+        text (str): Free text (typically the LLM's answer).
+
+    Returns:
+        set[str]: All ``_ID_PATTERN`` matches (R4.1, C5.1.2, O4.1.A, A1, …).
+        Used to render ONLY the nodes the answer actually cited in the Reasoning
+        View — the basis of "show the grounding for this answer".
+    """
     if not text:
         return set()
     return set(_ID_PATTERN.findall(text))
 
 
 def extract_sections_from_text(text: str):
-    """
-    Pull dotted section references like '5.1.2' or '§10.4' from free text.
-    Requires the section to appear near an indicator word (§, 'section',
-    'CoP §', etc.) so we don't grab every decimal number.
+    """Pull dotted section references (e.g. "§5.1.2", "section 10.4") from text.
+
+    Args:
+        text (str): Free text (typically the LLM's answer).
+
+    Returns:
+        set[str]: Dotted section numbers that appeared next to an indicator
+        token (§, "section", "CoP §", "sec.", "part").
+
+    Logical Rationale:
+        The indicator requirement is deliberate: a bare regex for dotted numbers
+        would also capture version strings, dates, and word-count ranges. Gating
+        on an explicit section marker keeps precision high so the Reasoning View
+        only resolves genuine policy-section citations.
     """
     if not text:
         return set()
@@ -1716,12 +2183,24 @@ def extract_sections_from_text(text: str):
 
 
 def resolve_section_refs_to_ids(graph, sections, policy_ids=None):
-    """
-    Find every node whose sourceSection matches one of the cited sections.
+    """Resolve cited section numbers to the node IDs that carry them.
 
-    When `policy_ids` is non-empty, results are restricted to nodes in
-    those policies — preventing a §5.1.2 citation from one document
-    pulling in an unrelated §5.1.2 from another.
+    Args:
+        graph (Neo4jGraph | None): The connected graph.
+        sections (Iterable[str]): Section numbers (from extract_sections_from_text).
+        policy_ids (Iterable[str] | None): If given, restrict matches to these
+            policies.
+
+    Returns:
+        set[str]: Node IDs whose ``sourceSection`` is in ``sections``; empty on
+        no input or query error.
+
+    Logical Rationale:
+        Policy-scoping is a correctness guard, not an optimisation: in a
+        multi-policy graph a "§5.1.2" citation from document A must not pull in
+        an unrelated "§5.1.2" from document B. Constraining on ``policy_id``
+        enforces the same disjoint-domain isolation the namespace provides
+        elsewhere in the pipeline.
     """
     if not sections or graph is None:
         return set()
@@ -1752,6 +2231,7 @@ def extract_node_ids(raw_result):
     """
     ids = set()
     def walk(o):
+        """Recurse through dicts/lists/strings, collecting node IDs into ``ids``."""
         if isinstance(o, dict):
             for k, v in o.items():
                 if isinstance(v, str):
@@ -1818,7 +2298,17 @@ def _clean_user_query(raw: str) -> str:
 
 
 def _keywords(question: str, top_k=5):
-    """Extract a handful of content keywords from the question."""
+    """Extract a handful of content keywords from a question.
+
+    Args:
+        question (str): The user question.
+        top_k (int): Max keywords to return. Default 5.
+
+    Returns:
+        list[str]: Up to ``top_k`` distinct 3+-char alphabetic tokens, stopwords
+        removed, in first-seen order. A lightweight signal for keyword retrieval
+        — deliberately not stemmed, since policy vocabulary is matched by CONTAINS.
+    """
     tokens = re.findall(r"[A-Za-z]{3,}", question.lower())
     seen, out = set(), []
     for t in tokens:
@@ -1833,11 +2323,20 @@ def _keywords(question: str, top_k=5):
 
 @st.cache_data(show_spinner=False, max_entries=512)
 def generate_search_variants(question: str, n: int = 4) -> list[str]:
-    """
-    Ask the lightweight LLM (GPT-4o-mini) for n alternate phrasings of the
-    user's question — synonyms, related concepts, formal/informal rewrites.
-    Returns a list of plain strings (no numbering, no preamble).
-    Cached so re-runs of the same question don't pay the LLM tax twice.
+    """Generate n alternative phrasings of a question via the gpt-4o-mini narrator.
+
+    Args:
+        question (str): The user question.
+        n (int): Number of variants to request. Default 4.
+
+    Returns:
+        list[str]: Plain variant strings (numbering/quotes stripped); empty if
+        the narrator is unavailable.
+
+    Logical Rationale:
+        A UI-side cousin of generate_multiple_queries: same recall-widening idea,
+        but on the cheaper narrator model and ``@st.cache_data``-cached so
+        re-running the identical question never re-bills the LLM.
     """
     if _narrator is None or not (question or "").strip():
         return []
@@ -1864,20 +2363,43 @@ def _semantic_search(graph, question: str, top_k: int = 8,
                      threshold: float = SEMANTIC_THRESHOLD,
                      score_window: int = 12,
                      use_fusion: bool = True):
-    """
-    Adaptive Fusion RAG semantic search across Rule and Condition embeddings.
+    """Retrieve grounding rows via Adaptive Fusion / dual-stream hybrid search.
 
-    use_fusion=True  (COMPLEX_REASONING):
-      Multi-query expansion → embed N variants → per-variant vector retrieval →
-      RRF across N ranked lists → cosine threshold → top-k.
+    Args:
+        graph (Neo4jGraph | None): The connected graph.
+        question (str): The cleaned user question.
+        top_k (int): Max kept nodes in Fusion mode. Default 8.
+        threshold (float): Cosine cut applied in Fusion mode only
+            (``SEMANTIC_THRESHOLD`` = 0.70).
+        score_window (int): Candidates pulled per vector index. Default 12.
+        use_fusion (bool): True → COMPLEX_REASONING path; False → DIRECT_LOOKUP.
 
-    use_fusion=False (DIRECT_LOOKUP):
-      Hybrid dual-stream RRF:
-        Stream A — single-vector similarity (cosine)
-        Stream B — keyword CONTAINS scored by match count
-      Both streams feed RRF; nodes matching both signals jump to the top.
-      Filtered to strict top-5 by RRF score (no cosine threshold cut for
-      keyword-only hits, preventing domain nodes from being dropped).
+    Returns:
+        tuple[str | None, list[dict], list[dict]]: ``(annotated_cypher, rows,
+        scores)`` — an audit-bearing query header, the grounding rows, and the
+        per-candidate transparency records (cosine, rrf, kept flag). ``(None,
+        [], [])`` when nothing is retrievable.
+
+    Mathematical/Logical Rationale:
+        Two retrieval profiles share one RRF backbone (k=60):
+
+        • **COMPLEX_REASONING (use_fusion=True).** Query expansion yields N
+          phrasings; each is embedded and run over both vector indices, giving N
+          ranked lists fused by RRF. The cosine ``threshold`` IS applied here —
+          in the multi-angle regime a high embedding score is trustworthy
+          evidence, so trimming sub-0.70 hits removes drift.
+
+        • **DIRECT_LOOKUP (use_fusion=False).** Two heterogeneous streams are
+          fused: Stream A = single-query vector similarity; Stream B = a keyword
+          CONTAINS count over description+label+text+label_human, seeded from a
+          curated ``_DOMAIN_KWS`` set plus soft tokens. The cosine threshold is
+          DELIBERATELY NOT applied; the kept set is the strict top-5 by RRF rank.
+          Rationale: a rare statutory keyword can be the exact answer yet score
+          ~0.0 cosine because the embedder under-represents it — RRF lets the
+          keyword stream rescue it, and a threshold cut would silently discard
+          precisely the node a factual lookup needs. RRF's rank-based fusion is
+          what makes combining an unbounded match-count with a [0,1] cosine
+          coherent without normalisation (see reciprocal_rank_fusion).
     """
     if _embedder is None or graph is None or not (question or "").strip():
         return None, [], []
@@ -1987,6 +2509,12 @@ def _semantic_search(graph, question: str, top_k: int = 8,
         return None, [], []
 
     # ── Step 3: Reciprocal Rank Fusion across all streams ────────────────────
+    # CRITICAL PARAMETER — RRF k=60. The fusion smoothing constant; RRF(d) =
+    # Σ 1/(k + rank_i(d)). k=60 is the value validated in the original Cormack
+    # et al. RRF work and retained unchanged: large enough to damp the dominance
+    # of any single stream's #1 hit (so vector and keyword streams genuinely
+    # negotiate), small enough that top ranks still matter. Empirically robust on
+    # the sparse/dense mix this system fuses (per ARCHITECTURE_REVIEW.md §4c-4d).
     rrf_scores_raw = dict(reciprocal_rank_fusion(per_query_rankings, k=60))
 
     # ── Step 4: Transparency record (kept flag uses RRF rank for direct mode) ─
@@ -2092,16 +2620,26 @@ def _semantic_search(graph, question: str, top_k: int = 8,
 
 
 def keyword_fallback_search(graph, question, use_fusion: bool = True):
-    """
-    Hybrid fallback used when the structured Cypher chain returns nothing.
-    Tries semantic vector search first; falls back to legacy CONTAINS.
+    """Fallback retrieval when the structured Cypher chain returns nothing.
 
-    use_fusion is forwarded to _semantic_search(): False skips multi-query
-    expansion (Adaptive RAG DIRECT_LOOKUP path).
+    Args:
+        graph (Neo4jGraph | None): The connected graph.
+        question (str): The cleaned user question.
+        use_fusion (bool): Forwarded to _semantic_search — False selects the
+            DIRECT_LOOKUP dual-stream path (no multi-query expansion).
 
-    Returns (cypher, rows, semantic_scores). `semantic_scores` is the list
-    of top candidates with kept/below-threshold flags (or [] if semantic
-    search was not used or failed).
+    Returns:
+        tuple[str | None, list[dict], list[dict]]: ``(cypher, rows,
+        semantic_scores)``; ``semantic_scores`` carries the candidate
+        kept/dropped flags for the audit chart (or [] if vector search was
+        unused/failed).
+
+    Logical Rationale:
+        Two-tier degradation: semantic/RRF search first (richest signal), then a
+        legacy CONTAINS query that works even with NO embedder — so the system
+        still answers offline or behind a proxy that blocks the embedding
+        endpoint. Candidate scores are passed through even on a miss so the UI
+        can show *why* the cut failed rather than a blank chart.
     """
     if graph is None:
         return None, [], []
@@ -2165,7 +2703,21 @@ def keyword_fallback_search(graph, question, use_fusion: bool = True):
 
 
 def _ground_answer_from_rows(question, rows):
-    """Generate a grounded answer directly from a rows list using QA_PROMPT."""
+    """Synthesise a grounded answer from fallback rows using QA_PROMPT.
+
+    Args:
+        question (str): The user question.
+        rows (list): Retrieved grounding rows (capped to 25 for the context).
+
+    Returns:
+        str: The grounded answer, or "LLM unavailable." without an API key.
+
+    Logical Rationale:
+        Used on the fallback path AFTER the CRAG gate has judged the context
+        RELEVANT, so synthesis only ever runs over validated context. Uses the
+        same QA_PROMPT (and T=0.1) as the primary chain so a fallback answer is
+        stylistically and behaviourally indistinguishable from a primary one.
+    """
     if not OPENAI_API_KEY:
         return "LLM unavailable."
     qa = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=OPENAI_API_KEY, **_llm_kwargs())
@@ -2177,8 +2729,27 @@ def _ground_answer_from_rows(question, rows):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.5  TRUST DASHBOARD & PLAIN-ENGLISH NARRATOR
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — transparency surface
+#   These helpers turn raw retrieval into the trust signals a non-technical
+#   reader can act on: a confidence verdict, a metric row (rules/conflicts/
+#   citations), and a 2-sentence plain-English narration that never leaks IDs,
+#   Cypher, or the word "graph". The narrator runs on gpt-4o-mini for cost.
+#
+# EXTENDING THIS SECTION
+#   • New trust metric: add a column in render_trust_dashboard and a _row_get
+#     over the relevant result keys (key names vary by retrieval path, hence the
+#     multi-key _row_get).
+#   • New confidence tier: adjust compute_confidence's thresholds; keep it a pure
+#     function of (row count, fallback flag, cypher presence) so it stays testable.
+# ─────────────────────────────────────────────────────────────────────────────
 def _init_narrator():
-    """GPT-4o-mini plain-English narrator (OpenAI-only)."""
+    """Construct the gpt-4o-mini plain-English narrator, or None without a key.
+
+    Returns:
+        ChatOpenAI | None: A low-cost narrator (T=0.2, max_tokens=120) used for
+        search variants and the friendly path summary; None if no API key, in
+        which case callers fall back to a static message.
+    """
     if OPENAI_API_KEY:
         return ChatOpenAI(
             model="gpt-4o-mini",
@@ -2194,7 +2765,21 @@ _narrator = _init_narrator()
 
 
 def _row_get(row, *keys):
-    """Safely read the first non-empty value for any of the given keys."""
+    """Read the first non-empty value among several candidate keys in a row.
+
+    Args:
+        row (dict): A Neo4j result row.
+        *keys (str): Candidate key names, tried in order.
+
+    Returns:
+        The first present, non-empty value, or None.
+
+    Logical Rationale:
+        Result key names differ across retrieval paths (e.g. ``ruleId`` from the
+        primary chain vs ``r.id`` from a raw query), so the dashboard accepts a
+        list of aliases rather than assuming one schema — keeping the UI robust
+        to which path produced the rows.
+    """
     if not isinstance(row, dict):
         return None
     for k in keys:
@@ -2204,7 +2789,24 @@ def _row_get(row, *keys):
 
 
 def compute_confidence(result_rows, cypher, used_fallback) -> tuple[str, str]:
-    """Return (label, icon) ∈ {Low 🔴, Medium 🟡, High 🟢}."""
+    """Derive a coarse answer-confidence verdict from retrieval signals.
+
+    Args:
+        result_rows (list): The grounding rows.
+        cypher (str): The executed query string ("N/A" if none ran).
+        used_fallback (bool): True if the answer came from the fallback path.
+
+    Returns:
+        tuple[str, str]: ``(label, icon)`` ∈ {("Low","🔴"), ("Medium","🟡"),
+        ("High","🟢")}.
+
+    Logical Rationale:
+        Confidence is a transparent function of three observable signals, not an
+        LLM self-estimate: zero rows ⇒ Low; a fallback answer ⇒ at most Medium
+        (structured retrieval missed, so trust is reduced); only a primary-chain
+        answer with ≥3 grounding rows earns High. Honest under-claiming is
+        preferred to overconfidence on a compliance surface.
+    """
     n = len(result_rows) if result_rows else 0
     if n == 0:
         return ("Low", "🔴")
@@ -2216,7 +2818,18 @@ def compute_confidence(result_rows, cypher, used_fallback) -> tuple[str, str]:
 
 
 def render_trust_dashboard(result_rows, cypher, used_fallback):
-    """4-column st.metric row: Rules checked / Conflicts detected / Citations / Confidence."""
+    """Render the 4-metric trust row for an answer.
+
+    Args:
+        result_rows (list): The grounding rows.
+        cypher (str): The executed query (feeds the confidence verdict).
+        used_fallback (bool): Whether the fallback path produced the answer.
+
+    Returns:
+        None. Writes a 4-column st.metric row — Rules checked / Conflicts
+        detected / Citations / Confidence — so the reader sees the evidence
+        behind the answer at a glance.
+    """
     rows = result_rows or []
 
     rules_checked = len({
@@ -2247,7 +2860,21 @@ def render_trust_dashboard(result_rows, cypher, used_fallback):
 
 
 def narrate_path(result_rows) -> str:
-    """Turn the retrieved rows into EXACTLY 2 friendly sentences — no IDs, no Cypher, no 'graph'."""
+    """Summarise the retrieval as exactly 2 jargon-free sentences for a student.
+
+    Args:
+        result_rows (list): The grounding rows.
+
+    Returns:
+        str: A 2-sentence plain-English summary of which policy areas were
+        consulted and whether conflicts were found; a static fallback message if
+        the narrator is unavailable.
+
+    Logical Rationale:
+        The prompt forbids node IDs, Cypher, and the word "graph" so a
+        non-technical reader is never exposed to retrieval internals — the
+        transparency goal is *understanding*, not a data dump.
+    """
     if _narrator is None or not result_rows:
         return "We checked the policy graph for you."
 
@@ -2277,6 +2904,7 @@ def extract_active_policy_ids(raw_rows) -> set:
     pids: set = set()
 
     def walk(o):
+        """Recurse through the result, collecting policy identifiers into ``pids``."""
         if isinstance(o, dict):
             for k, v in o.items():
                 if k in ("policyId", "policy_id", "p.id") and isinstance(v, str) and v:
@@ -2301,6 +2929,30 @@ _CRAG_REFUSAL = (
 
 
 def run_query(question, chain):
+    """Execute the full Modular-RAG read path for one question.
+
+    Args:
+        question (str): The raw user question (cleaned internally).
+        chain (GraphCypherQAChain): The structured-retrieval chain.
+
+    Returns:
+        dict: A result bundle with keys ``answer``, ``cypher``, ``raw`` (rows),
+        ``node_ids`` (cited, for the Reasoning View), ``policy_ids``,
+        ``used_fallback``, ``semantic_scores``, ``crag_status``, ``crag_reason``,
+        ``route``, ``route_reason``, ``error``.
+
+    Logical Rationale:
+        Orchestrates the pipeline in fixed order: clean → route (Adaptive RAG,
+        which sets ``use_fusion``) → structured Cypher first → if empty or the
+        "not available" sentinel fires, Fusion/keyword fallback → CRAG gate →
+        grounded answer (or honest refusal). CRAG runs at two points: as a
+        PRE-generation gate on the fallback path (so a weak context never reaches
+        synthesis) and as a POST-hoc check on the primary path (an independent
+        audit signal). Every branch funnels into one return shape so the UI can
+        render the same transparency fields regardless of which path answered.
+        The whole body is wrapped so any exception returns an error bundle rather
+        than crashing the Streamlit run.
+    """
     # ── Isolate the exact user string — strip whitespace and any UI leakage ──
     question = _clean_user_query(question)
 
@@ -2417,7 +3069,21 @@ except Exception:
 
 
 def _ctx_precision(expected: set, retrieved: set) -> float:
-    """|expected ∩ retrieved| / |retrieved|. Both empty = 1.0 (vacuously true)."""
+    """Context Precision — fraction of retrieved nodes that were expected.
+
+    Args:
+        expected (set): Gold node IDs for the question.
+        retrieved (set): Node IDs the pipeline actually retrieved.
+
+    Returns:
+        float: ``|expected ∩ retrieved| / |retrieved|`` in [0, 1].
+
+    Mathematical/Logical Rationale:
+        Precision penalises retrieving *irrelevant* nodes (noise in the synthesis
+        context). Edge cases follow set-logic convention: both sets empty ⇒ 1.0
+        (vacuously perfect — nothing wrong was retrieved); retrieved empty but
+        expectations exist ⇒ 0.0 (nothing right was retrieved).
+    """
     if not expected and not retrieved:
         return 1.0
     if not retrieved:
@@ -2426,7 +3092,22 @@ def _ctx_precision(expected: set, retrieved: set) -> float:
 
 
 def _ctx_recall(expected: set, retrieved: set) -> float:
-    """|expected ∩ retrieved| / |expected|."""
+    """Context Recall — fraction of expected nodes that were retrieved.
+
+    Args:
+        expected (set): Gold node IDs for the question.
+        retrieved (set): Node IDs the pipeline actually retrieved.
+
+    Returns:
+        float: ``|expected ∩ retrieved| / |expected|`` in [0, 1]; 1.0 when no
+        nodes were expected (nothing to miss).
+
+    Mathematical/Logical Rationale:
+        Recall penalises *missing* required evidence. Precision and recall are
+        complementary: a pipeline can game one alone (retrieve everything ⇒
+        recall 1, precision low; retrieve one sure hit ⇒ precision 1, recall
+        low), so the benchmark reports both to expose that trade-off per query.
+    """
     if not expected:
         return 1.0
     return len(expected & retrieved) / len(expected)
@@ -2494,10 +3175,25 @@ def _simple_rag_retrieve(graph, question: str, top_k: int = 10):
 
 
 def benchmark_question(graph, chain, test_case: dict) -> dict:
-    """
-    Run a single gold-dataset case through both pipelines and compute the
-    headline ragas-style metrics: Context Precision, Context Recall,
-    Faithfulness. Returns a dict the UI can render directly.
+    """Benchmark one gold case across GraphRAG and a flat Simple-RAG baseline.
+
+    Args:
+        graph (Neo4jGraph): The connected graph (for the baseline retriever).
+        chain (GraphCypherQAChain): The structured chain (for GraphRAG).
+        test_case (dict): A gold case with ``question``, ``ground_truth``,
+            ``expected_node_ids``, and optional ``expected_edges``.
+
+    Returns:
+        dict: Per-pipeline metrics (context precision/recall, path accuracy,
+        faithfulness, counts) plus the case metadata — ready for UI rendering.
+
+    Mathematical/Logical Rationale:
+        Running both pipelines on the SAME gold case is what makes the comparison
+        fair: identical expected sets feed _ctx_precision/_ctx_recall, so any
+        delta reflects retrieval strategy, not question difficulty. ``path
+        accuracy`` (fraction of expected edges present in the generated Cypher)
+        is GraphRAG-only and 0.0 for the baseline by definition — the baseline
+        performs no graph traversal, which is precisely the capability under test.
     """
     question     = test_case["question"]
     ground_truth = test_case.get("ground_truth", "")
@@ -2553,7 +3249,24 @@ def benchmark_question(graph, chain, test_case: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # 8.  SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — Streamlit session state
+#   All cross-rerun UI state lives in st.session_state, seeded once by
+#   _init_state(). Streamlit re-executes this whole script top-to-bottom on every
+#   interaction, so anything that must survive a rerun (chat history, last
+#   reasoning subgraph, layout toggle) belongs here, not in a local variable.
+#
+# EXTENDING THIS SECTION
+#   • New persistent UI field: add a key + default to the `defaults` dict below.
+#     Initialise it here (never inline at the use site) so a rerun before the
+#     widget is drawn cannot raise KeyError.
+# ─────────────────────────────────────────────────────────────────────────────
 def _init_state():
+    """Seed all required st.session_state keys with defaults exactly once.
+
+    Returns:
+        None. Mutates ``st.session_state`` in place, only filling keys that are
+        absent so existing user state is never clobbered on a rerun.
+    """
     defaults = {
         "messages": [],
         "ingest_log": [],
@@ -2591,6 +3304,18 @@ total_nodes = count_nodes(graph) if graph else 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. SIDEBAR — Status dashboard + data mgmt + graph controls
+# ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — sidebar control surface (top-level script, runs every rerun)
+#   Renders connection status, the "🔄 Reconnect" button (which clears the
+#   cached resources — see §4/§9), PDF ingestion, policy listing/deletion, and
+#   graph-layout controls. This is procedural Streamlit, not a function, so it
+#   reads the module-level `graph`/`chain` initialised in §9.
+#
+# EXTENDING THIS SECTION
+#   • New sidebar control: add it inside the `with st.sidebar:` block and persist
+#     any stateful value through st.session_state (declared in §8).
+#   • Any action that invalidates a cached resource must call its `.clear()` and
+#     `st.rerun()` so the change takes effect — mirror the Reconnect button.
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎓 BU Policy GraphRAG")
@@ -2647,6 +3372,7 @@ with st.sidebar:
         else:
             st.session_state.ingest_log = []
             def logger(level, msg):
+                """log_fn sink: append (level, msg) to the live ingest log in session state."""
                 st.session_state.ingest_log.append((level, msg))
             try:
                 with st.spinner("Ingesting XML..."):
@@ -2680,6 +3406,7 @@ with st.sidebar:
                 _chunk_status = st.empty()
 
                 def pdf_logger(level, msg):
+                    """log_fn sink for the PDF→XML stage: record the line and live-surface chunk/err progress."""
                     st.session_state.ingest_log.append((level, msg))
                     # Surface chunk-level progress immediately so the user can
                     # see which chunk stalled without waiting for rerun.
@@ -2858,6 +3585,18 @@ with st.sidebar:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. MAIN AREA — Trust & Live Analytics Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+# ARCHITECTURE — main panel (top-level script)
+#   Renders the chat input, runs run_query() (§7), and lays out the answer
+#   alongside its transparency surface: the trust dashboard (§7.5), the
+#   plain-English narration, the CRAG/route audit, the semantic-score chart, and
+#   the Reasoning View built from fetch_reasoning_subgraph() (§6).
+#
+# EXTENDING THIS SECTION
+#   • New answer-side panel: read from the run_query() result dict (its keys are
+#     documented on that function) and render below the existing dashboard.
+#   • Keep heavy work inside run_query / the cached resources; this block should
+#     stay presentation-only so a rerun is cheap.
 # ─────────────────────────────────────────────────────────────────────────────
 import ast as _ast
 
@@ -3129,6 +3868,7 @@ if st.session_state.get("benchmark_result"):
     sr = res["simplerag"]
 
     def _delta(a, b):
+        """Format the signed GraphRAG−SimpleRAG metric gap (e.g. "+0.250"), or "—"."""
         try:
             d = float(a) - float(b)
             return f"{'+' if d >= 0 else ''}{d:.3f}"
