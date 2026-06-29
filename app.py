@@ -36,11 +36,13 @@ def _llm_kwargs() -> dict:
     """Return {'http_client': <client>} when a truststore client is available."""
     return {"http_client": _http_client} if _http_client is not None else {}
 
+import ast
 import os
 import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from typing import Callable, Optional
 
 import streamlit as st
 import pandas as pd
@@ -93,6 +95,12 @@ except Exception:
         return {"route": "COMPLEX_REASONING", "reason": "Adaptive RAG module unavailable."}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ║ LAYER 1 — CONFIG & ENVIRONMENT
+# ║ Page setup, credential resolution, embedding-backend selection, and the LLM
+# ║ prompt contracts. Pure configuration: no graph mutations or UI side effects.
+# ║ (Covers sections §0–§3 below.)
+# ═══════════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -427,6 +435,13 @@ QA_PROMPT = PromptTemplate(
 )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ║ LAYER 2 — INFRASTRUCTURE  (LLM · Neo4j · Embedder)
+# ║ Cached, self-healing connections to the external services the platform depends
+# ║ on. (The embedding backend is initialised earlier, in §2, because EMBEDDING_DIMS
+# ║ must be resolved before the prompt/index config that references it.)
+# ║ (Covers section §4 below.)
+# ═══════════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  RESOURCE INITIALISATION  (cached)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -511,7 +526,7 @@ def init_chain(_graph):
         return None, str(e)
 
 
-def count_nodes(graph) -> int:
+def count_nodes(graph: Neo4jGraph) -> int:
     """Return the total node count in the graph, or 0 if unavailable.
 
     Args:
@@ -531,7 +546,7 @@ def count_nodes(graph) -> int:
         return 0
 
 
-def get_ingested_policies(graph) -> list[dict]:
+def get_ingested_policies(graph: Neo4jGraph) -> list[dict]:
     """
     Read the (:Policy) nodes straight from Neo4j (never from st.session_state)
     with their Rule/Condition/Outcome child counts, newest first.
@@ -566,7 +581,7 @@ def get_ingested_policies(graph) -> list[dict]:
     return list(graph.query(q))
 
 
-def delete_policy(graph, policy_id: str) -> dict:
+def delete_policy(graph: Neo4jGraph, policy_id: str) -> dict:
     """
     Detach-delete a Policy node AND every Rule/Condition/Outcome attached
     to it via BELONGS_TO. Returns a stats dict with counts of what was
@@ -609,6 +624,12 @@ def delete_policy(graph, policy_id: str) -> dict:
         return {"policies": 0, "members": 0, "error": str(e)}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ║ LAYER 3 — INGESTION LAYER
+# ║ The write path: PDF → strict XML → namespaced Neo4j knowledge graph, with
+# ║ semantic human labelling, risk flagging, and per-dimension vector indices.
+# ║ (Covers sections §5 and §5.5 below.)
+# ═══════════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  XML → NEO4J INGESTER  (with live process log + semantic labelling)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -818,7 +839,7 @@ OUTPUT RULES
 """
 
 
-def _extract_pdf_text(pdf_bytes: bytes, log_fn) -> str:
+def _extract_pdf_text(pdf_bytes: bytes, log_fn: Callable) -> str:
     """Extract all text from an uploaded PDF using PyMuPDF (fitz).
 
     Args:
@@ -918,7 +939,7 @@ def _chunk_text(text: str, chunk_size: int = 80_000, overlap: int = 2_000) -> li
     return chunks
 
 
-def _merge_xml_fragments(raw_fragments: list[str], log_fn) -> str:
+def _merge_xml_fragments(raw_fragments: list[str], log_fn: Callable) -> str:
     """Merge per-chunk XML fragments into one deduplicated <Rule> body.
 
     Args:
@@ -1047,10 +1068,43 @@ def _merge_xml_fragments(raw_fragments: list[str], log_fn) -> str:
     )
 
 
-def process_pdf_to_xml(pdf_file, log_fn) -> bytes:
-    """
-    End-to-end: uploaded PDF → extracted text → GPT-4o structured XML → bytes
-    ready for ingest_xml_to_neo4j. Uses GPT-4o (temperature=0) exclusively.
+def process_pdf_to_xml(pdf_file, log_fn: Callable) -> bytes:
+    """Convert an uploaded policy PDF into validated, ingest-ready ``<Policy>`` XML.
+
+    Runs the full Stage-1 extraction pipeline: PDF bytes → PyMuPDF text →
+    sliding-window chunks → per-chunk GPT-4o structured XML → dedup/merge →
+    well-formedness gate.
+
+    Args:
+        pdf_file: An uploaded file object (anything exposing ``.read()``) or the
+            raw ``bytes`` of the PDF.
+        log_fn (Callable): ``log_fn(level, message)`` progress sink
+            (``level ∈ {info, success, warn, err}``) for the live UI log.
+
+    Returns:
+        bytes: A single, ``ElementTree``-validated ``<Policy>…</Policy>`` byte
+        string ready to hand to ``ingest_xml_to_neo4j``.
+
+    Raises:
+        RuntimeError: If the PDF yields no extractable text (e.g. an image-only
+            scan with no OCR layer) — surfaced to the UI rather than silently
+            ingesting a blank graph.
+        Exception: Any LLM or XML-validation failure is re-raised (fail-loud) so
+            a partial or corrupt extraction never reaches Neo4j.
+
+    Design Rationale:
+        • **Bounded chunks for valid XML.** Input is split into 15k-char windows
+          with 1.5k overlap. GPT-4o emits complete, parseable XML far more
+          reliably on small inputs than on a whole document, and the overlap keeps
+          a section header that straddles a boundary intact in at least one chunk
+          — preserving the section-anchored id grammar (see inline note below).
+        • **Deterministic extraction.** A single GPT-4o instance at
+          ``temperature=0`` is reused across chunks for reproducibility (critical
+          for evaluation) and to avoid per-chunk client-construction cost.
+        • **Validate before return.** The merged fragment is passed through
+          ``ET.fromstring`` as a final gate; malformed XML is reported with its
+          offending line and blocks ingestion, upholding the "omission over
+          fabrication" contract that keeps the live graph clean.
     """
     pdf_bytes = pdf_file.read() if hasattr(pdf_file, "read") else pdf_file
     text = _extract_pdf_text(pdf_bytes, log_fn)
@@ -1164,21 +1218,54 @@ def _slugify(s: str) -> str:
     return s or "policy"
 
 
-def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
+def ingest_xml_to_neo4j(xml_content: bytes, graph: Neo4jGraph, log_fn: Callable,
                          policy_title: str | None = None,
-                         policy_version: str | None = None):
-    """
-    Parse XML and MERGE Rules / Conditions / Outcomes plus relationships,
-    all scoped to a (:Policy) root node via a policy_id namespace.
+                         policy_version: str | None = None) -> dict:
+    """Map validated policy XML into a namespaced Neo4j knowledge graph.
 
-    `log_fn(level, message)` is called for every step so the UI can render
-    a real-time process log (level ∈ {info, success, warn, err}).
-    Returns a stats dict.
+    Parses the XML tree and idempotently ``MERGE``s a ``(:Policy)`` root plus its
+    ``(:Rule)`` / ``(:Condition)`` / ``(:Outcome)`` members and their
+    relationships (``BELONGS_TO``, ``HAS_CONDITION``, ``HAS_OUTCOME``, and any
+    ``CONFLICTS_WITH``), attaching semantic ``label_human`` titles, ``is_risk``
+    flags, and vector embeddings as it goes.
 
-    Policy metadata precedence:
-      1. Explicit policy_title / policy_version arguments
-      2. Attributes on the XML root element if it is <Policy>
-      3. Fallback: "Untitled Policy" / "unspecified"
+    Args:
+        xml_content (bytes): Well-formed ``<Policy>`` XML, as produced and
+            validated by ``process_pdf_to_xml`` / ``_wrap_xml_fragment``.
+        graph (Neo4jGraph): A connected graph handle (writes execute immediately).
+        log_fn (Callable): ``log_fn(level, message)`` progress sink, with
+            ``level ∈ {info, success, warn, err}``, so the Streamlit UI can render
+            a live ingestion log.
+        policy_title (str | None): Overrides the title used to build the policy
+            namespace. Falls back to the XML root's ``title`` attribute, then
+            ``"Untitled Policy"``.
+        policy_version (str | None): Overrides the version. Falls back to the
+            root's ``version`` attribute, then ``"unspecified"``.
+
+    Returns:
+        dict: A stats bundle with keys ``rules``, ``conditions``, ``outcomes``,
+        ``has_condition``, ``has_outcome``, ``conflicts``, ``errors``,
+        ``policy_id`` and ``policy_title`` — surfaced in the UI as the ingestion
+        summary.
+
+    Design Rationale:
+        • **Idempotent compound-id MERGE.** Every member is MERGEd on its
+          section-anchored id (e.g. ``C_13_1_LawThesisWordLimit``) scoped by
+          ``policy_id``, so re-ingesting the same document updates in place
+          instead of duplicating, and a clause shared by two rules attaches to a
+          single node rather than forking.
+        • **Single-corpus clean slate.** Ingestion begins with
+          ``MATCH (n) DETACH DELETE n`` (wrapped to warn-not-crash): the platform
+          is intentionally a one-policy system, so a new ingest REPLACES the
+          graph. The wipe is soft-failed so a transient delete error cannot abort
+          an otherwise valid rebuild.
+        • **Soft-fail per write, fail-loud per parse.** Individual MERGE failures
+          are tallied in ``stats['errors']`` and logged, never raised, so one bad
+          clause cannot lose the whole document; an unparseable XML root, by
+          contrast, is fatal (re-raised) because nothing downstream is then safe.
+        • **Provenance namespacing.** ``policy_id = slug(title)-slug(version)``
+          gives every node a scope, which is exactly what later lets
+          ``delete_policy`` detach one policy without touching others.
     """
     log_fn("info", "📄 Parsing XML document...")
     try:
@@ -1448,6 +1535,13 @@ def ingest_xml_to_neo4j(xml_content: bytes, graph, log_fn,
     return stats
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ║ LAYER 4 — QUERY & RETRIEVAL LAYER
+# ║ The read path: the Modular-RAG orchestrator (Adaptive routing → structured
+# ║ Cypher → Fusion/dual-stream RRF → CRAG validation → grounded answer), plus the
+# ║ reasoning-subgraph renderer, trust dashboard, narrator, and RAGAS benchmarking
+# ║ that surface and audit each answer. (Covers sections §6, §7, §7.5 and §7.6.)
+# ═══════════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  GRAPH VISUALISATION HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1790,7 +1884,7 @@ def decorate_with_search(nodes, query: str):
     return hits, len(nodes)
 
 
-def fetch_full_graph(graph, limit=500):
+def fetch_full_graph(graph: Optional[Neo4jGraph], limit: int = 500) -> tuple:
     """Build (nodes, edges) for the whole graph, for the full-corpus view.
 
     Args:
@@ -1847,8 +1941,8 @@ def fetch_full_graph(graph, limit=500):
     return nodes, edges
 
 
-def fetch_reasoning_subgraph(graph, node_ids, policy_ids=None,
-                              top_k: int = 5, score_map=None):
+def fetch_reasoning_subgraph(graph: Optional[Neo4jGraph], node_ids, policy_ids=None,
+                              top_k: int = 5, score_map=None) -> tuple:
     """Build the 1-hop "the AI looked here" subgraph around the cited node IDs.
 
     Args:
@@ -2359,10 +2453,10 @@ def generate_search_variants(question: str, n: int = 4) -> list[str]:
         return []
 
 
-def _semantic_search(graph, question: str, top_k: int = 8,
+def _semantic_search(graph: Optional[Neo4jGraph], question: str, top_k: int = 8,
                      threshold: float = SEMANTIC_THRESHOLD,
                      score_window: int = 12,
-                     use_fusion: bool = True):
+                     use_fusion: bool = True) -> tuple:
     """Retrieve grounding rows via Adaptive Fusion / dual-stream hybrid search.
 
     Args:
@@ -2619,7 +2713,8 @@ def _semantic_search(graph, question: str, top_k: int = 8,
     return annotated_cypher, rows, scores
 
 
-def keyword_fallback_search(graph, question, use_fusion: bool = True):
+def keyword_fallback_search(graph: Optional[Neo4jGraph], question: str,
+                            use_fusion: bool = True) -> tuple:
     """Fallback retrieval when the structured Cypher chain returns nothing.
 
     Args:
@@ -2928,7 +3023,7 @@ _CRAG_REFUSAL = (
 )
 
 
-def run_query(question, chain):
+def run_query(question: str, chain) -> dict:
     """Execute the full Modular-RAG read path for one question.
 
     Args:
@@ -3060,7 +3155,7 @@ def run_query(question, chain):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.5  RAGAS BENCHMARKING — Gold Dataset comparison
+# 7.6  RAGAS BENCHMARKING — Gold Dataset comparison
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     from evaluation_dataset import EVAL_DATASET
@@ -3246,6 +3341,12 @@ def benchmark_question(graph, chain, test_case: dict) -> dict:
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ║ LAYER 5 — UI / STREAMLIT LAYER
+# ║ The top-level script body that runs on every rerun: session-state bootstrap,
+# ║ resource wiring, sidebar control surface, and the main trust/analytics panel.
+# ║ (Covers sections §8–§11 below.)
+# ═══════════════════════════════════════════════════════════════════════════════
 # ─────────────────────────────────────────────────────────────────────────────
 # 8.  SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3598,8 +3699,6 @@ with st.sidebar:
 #   • Keep heavy work inside run_query / the cached resources; this block should
 #     stay presentation-only so a rerun is cheap.
 # ─────────────────────────────────────────────────────────────────────────────
-import ast as _ast
-
 st.title("🎓 BU Policy GraphRAG Platform")
 st.caption(
     "Transparent Knowledge Management & Reasoning · "
@@ -3754,7 +3853,7 @@ for msg in st.session_state.messages:
                     for _line in cypher_hdr.splitlines():
                         if _line.startswith("-- queries:"):
                             try:
-                                variant_lines = _ast.literal_eval(
+                                variant_lines = ast.literal_eval(
                                     _line.replace("-- queries:", "").strip()
                                 )
                             except Exception:
@@ -4119,3 +4218,74 @@ if question:
     st.session_state.last_reasoning = r["node_ids"]
     st.session_state.last_policy_ids = r.get("policy_ids") or set()
     st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ║ EXTENSIBILITY & FUTURE WORK
+# ═══════════════════════════════════════════════════════════════════════════════
+# This file is organised as five macro-layers (CONFIG → INFRASTRUCTURE →
+# INGESTION → QUERY/RETRIEVAL → UI). Most extensions touch only one or two of
+# them. The recipes below name the exact functions/constants to edit.
+#
+# ── 1. ADD A NEW RELATIONSHIP (EDGE) TYPE ──────────────────────────────────────
+#   Goal: teach the graph and the Cypher LLM about a new edge, e.g.
+#         (:Rule)-[:SUPERSEDES]->(:Rule).
+#   Steps (all in the INGESTION + CONFIG layers):
+#     (a) CONFIG §3 — CYPHER_GENERATION_TEMPLATE: add the edge under
+#         "RELATIONSHIP TYPES" (with direction + properties), add it to MANDATORY
+#         RULE 4's OPTIONAL MATCH list so a missing edge never wipes the result
+#         set, and add ONE worked EXAMPLE that traverses it (few-shot > prose for
+#         Cypher generation). Keep this in sync with the same constant in
+#         graphrag_policy_bot.py.
+#     (b) INGESTION §5 — ingest_xml_to_neo4j(): MERGE the edge while iterating the
+#         XML, reusing the compound-id MERGE pattern so it stays idempotent. Add a
+#         counter to the `stats` dict if you want it surfaced in the ingest summary.
+#     (c) (optional) CONFIG §3 — QA_SYSTEM_TEMPLATE: add a GROUNDING RULE if the
+#         edge must be cited in the reader-facing answer.
+#     (d) (optional) QUERY §6 — _color_for / LABEL_COLORS and fetch_reasoning_
+#         subgraph(): give the edge a colour/handling if it should appear in the
+#         Reasoning View.
+#   Do NOT change the retrieval math (RRF, SEMANTIC_THRESHOLD) for this — new
+#   edges are a schema concern, not a ranking one.
+#
+# ── 2. ADD / SWAP A POLICY ─────────────────────────────────────────────────────
+#   The platform is intentionally SINGLE-CORPUS: ingest_xml_to_neo4j() wipes the
+#   graph (MATCH (n) DETACH DELETE n) before each run, so ingesting a new policy
+#   REPLACES the current one. To ingest:
+#     • Use the sidebar "Ingest" flow (PDF → process_pdf_to_xml → ingest), or call
+#       ingest_xml_to_neo4j(xml_bytes, graph, log_fn, policy_title=..., version=...)
+#       directly. Every node is namespaced by policy_id = slug(title)-slug(version).
+#   To support MULTIPLE policies at once (future work):
+#     • Remove the DETACH DELETE wipe in ingest_xml_to_neo4j() and rely on the
+#       policy_id namespace (already present on every node) for isolation.
+#     • get_ingested_policies() / delete_policy() already operate per-policy_id, so
+#       the listing/teardown UI needs no change.
+#     • Decide cross-policy scope in run_query()/extract_active_policy_ids(): today
+#       a query is scoped to the policy_ids cited in the answer; multi-policy
+#       comparison queries would widen that scope deliberately.
+#
+# ── 3. SWAP THE EMBEDDING BACKEND ──────────────────────────────────────────────
+#   CONFIG §2 — _init_embedder(): change the model string (and its dimension if it
+#   differs from 384/1536). Because every vector index is (re)created at the live
+#   EMBEDDING_DIMS during ingest, a dimension change is safe ONLY if you RE-INGEST
+#   afterwards so rule_text_index / condition_text_index are rebuilt at the new
+#   width. Add a third backend by appending a (package, class) pair to the probe
+#   loop — order = priority.
+#
+# ── 4. TUNE RETRIEVAL ──────────────────────────────────────────────────────────
+#   QUERY §7 — SEMANTIC_THRESHOLD (0.70) governs the COMPLEX_REASONING cosine cut
+#   only; DIRECT_LOOKUP deliberately bypasses it (see _semantic_search). The RRF
+#   constant k=60 lives in reciprocal_rank_fusion(). Change these together with a
+#   re-run of the RAGAS benchmark (§7.6) so a tuning change is always measured,
+#   never guessed.
+#
+# ── 5. LONGER-HORIZON IDEAS ────────────────────────────────────────────────────
+#   • Materialise CONFLICTS_WITH at ingest (the schema already accepts the edge
+#     with scenario/resolution/sections/cross_policy props; the current single
+#     corpus simply contains none) to light up deterministic conflict detection.
+#   • Promote the prototype's richer edge vocabulary (ESCALATES_TO, OVERRIDES,
+#     GOVERNED_BY, SATISFIES, TRIGGERS, RESTRICTS — see graphrag_policy_bot.py)
+#     into the production ingester for multi-hop eligibility reasoning.
+#   • Add an OCR pre-pass in _extract_pdf_text() so image-only scans (today a
+#     fail-loud RuntimeError) become ingestible.
+# ═══════════════════════════════════════════════════════════════════════════════

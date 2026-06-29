@@ -19,7 +19,12 @@
       "Bash(python -c ' *)",
       "Bash(nohup streamlit run app.py --server.headless true --server.port 8501)",
       "Bash(python -m py_compile app.py graphrag_policy_bot.py)",
-      "Bash(python -c \"import ast,io; [print\\(f, 'parsed OK,', sum\\(isinstance\\(n,ast.FunctionDef\\) and ast.get_docstring\\(n\\) is not None for n in ast.walk\\(ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\)\\)\\), 'of', sum\\(isinstance\\(n,ast.FunctionDef\\) for n in ast.walk\\(ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\)\\)\\), 'functions have docstrings'\\) for f in ['app.py','graphrag_policy_bot.py']]\")"
+      "Bash(python -c \"import ast,io; [print\\(f, 'parsed OK,', sum\\(isinstance\\(n,ast.FunctionDef\\) and ast.get_docstring\\(n\\) is not None for n in ast.walk\\(ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\)\\)\\), 'of', sum\\(isinstance\\(n,ast.FunctionDef\\) for n in ast.walk\\(ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\)\\)\\), 'functions have docstrings'\\) for f in ['app.py','graphrag_policy_bot.py']]\")",
+      "PowerShell(python -m py_compile app.py)",
+      "PowerShell(if \\($?\\) { \"BASELINE: app.py compiles clean\" })",
+      "PowerShell(if \\($?\\) { \"OK: app.py compiles clean\" } else { \"FAIL\" })",
+      "PowerShell(if \\($?\\) { \"OK: app.py compiles clean\" })",
+      "Bash(python -c \"import streamlit, langchain_neo4j, langchain_openai; print\\('core deps OK'\\)\")"
     ]
   }
 }

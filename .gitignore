@@ -13,8 +13,14 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Installation logs
+# Installation & runtime logs
 install_output.txt
+streamlit_run.log
+*.log
+
+# Copyrighted source PDFs (policy docs + cited papers) — never commit
+*.pdf
+Citation/
 
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
